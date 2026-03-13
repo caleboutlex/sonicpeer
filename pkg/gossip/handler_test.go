@@ -92,7 +92,7 @@ func setupTestHandler(b *testing.B) *handler {
 	}
 }
 
-// 1 tx    BenchmarkHandleMsg_EvmTxs-8       900356              1142 ns/op             752 B/op       20 allocs/op
+// BenchmarkHandleMsg_EvmTxs-8      1000000              1146 ns/op             640 B/op         18 allocs/op
 func BenchmarkHandleMsg_EvmTxs(b *testing.B) {
 	h := setupTestHandler(b)
 
@@ -131,7 +131,7 @@ func BenchmarkHandleMsg_EvmTxs(b *testing.B) {
 	}
 }
 
-// BenchmarkHandleMsg_NewEvmTxHashes-8      2183997               535.8 ns/op           272 B/op          7 allocs/op
+// BenchmarkHandleMsg_NewEvmTxHashes-8      2405580               642.7 ns/op           176 B/op          6 allocs/op
 func BenchmarkHandleMsg_NewEvmTxHashes(b *testing.B) {
 	h := setupTestHandler(b)
 
@@ -160,7 +160,7 @@ func BenchmarkHandleMsg_NewEvmTxHashes(b *testing.B) {
 	}
 }
 
-// BenchmarkHandleMsg_NewEventIDs-8          186656              6303 ns/op            3440 B/op          7 allocs/op
+// BenchmarkHandleMsg_NewEventIDs-8          184945              6958 ns/op            3344 B/op          6 allocs/op
 func BenchmarkHandleMsg_NewEventIDs(b *testing.B) {
 	h := setupTestHandler(b)
 
@@ -189,7 +189,7 @@ func BenchmarkHandleMsg_NewEventIDs(b *testing.B) {
 	}
 }
 
-// BenchmarkHandleMsg_GetPeerInfos-8        2353803               511.1 ns/op           272 B/op          8 allocs/op
+// BenchmarkHandleMsg_GetPeerInfos-8        2243564               585.5 ns/op           272 B/op          8 allocs/op
 func BenchmarkHandleMsg_GetPeerInfos(b *testing.B) {
 	h := setupTestHandler(b)
 
@@ -210,7 +210,7 @@ func BenchmarkHandleMsg_GetPeerInfos(b *testing.B) {
 	}
 }
 
-// BenchmarkHandleMsg_PeerInfos-8             59460             20115 ns/op            5216 B/op      95 allocs/op
+// BenchmarkHandleMsg_PeerInfos-8             55868             21742 ns/op            5217 B/op         95 allocs/op
 func BenchmarkHandleMsg_PeerInfos(b *testing.B) {
 	h := setupTestHandler(b)
 
@@ -242,7 +242,7 @@ func BenchmarkHandleMsg_PeerInfos(b *testing.B) {
 	}
 }
 
-// BenchmarkHandleMsg_GetEndPoint-8          223897              5505 ns/op            1464 B/op         31 allocs/op
+// BenchmarkHandleMsg_GetEndPoint-8          221518              5472 ns/op            1464 B/op         31 allocs/op
 func BenchmarkHandleMsg_GetEndPoint(b *testing.B) {
 	h := setupTestHandler(b)
 
@@ -262,7 +262,7 @@ func BenchmarkHandleMsg_GetEndPoint(b *testing.B) {
 	}
 }
 
-// BenchmarkHandleMsg_EndPointUpdate-8        59600             19818 ns/op            5234 B/op         92 allocs/op
+// BenchmarkHandleMsg_EndPointUpdate-8        56359             21389 ns/op            5147 B/op         92 allocs/op
 func BenchmarkHandleMsg_EndPointUpdate(b *testing.B) {
 	h := setupTestHandler(b)
 

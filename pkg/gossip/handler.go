@@ -139,8 +139,6 @@ type handler struct {
 	config    Config
 	dataDir   string
 
-	syncStatus syncStatus
-
 	txpool   TxPool
 	maxPeers int
 
