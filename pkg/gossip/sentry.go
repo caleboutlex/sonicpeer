@@ -32,6 +32,11 @@ type SentryConfig struct {
 	ListenPort int
 	MaxPeers   int
 
+	// Metrics and Profiling
+	MetricsEnabled bool
+	MetricsAddr    string
+	MetricsPort    int
+
 	// Sentry's own RPC server settings
 	HTTPEnabled      bool
 	HTTPListenAddr   string

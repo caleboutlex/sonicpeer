@@ -80,7 +80,11 @@ func (c *connectionAdvisor[I, T]) GetNewPeerSuggestion() T {
 
 	// Search for a peer of a peer that is not already connected to the local node.
 	now := time.Now()
-	var candidates []T
+	// Use reservoir sampling (Algorithm R) to select a single random candidate
+	// without allocating a slice to hold all of them. This is more memory-efficient.
+	var candidate T
+	var foundCandidate bool
+	count := 0
 
 	for peer, entry := range c.neighborhood {
 		if now.Sub(entry.time) > c.maxPeerInfoAge {
@@ -88,21 +92,25 @@ func (c *connectionAdvisor[I, T]) GetNewPeerSuggestion() T {
 			continue
 		}
 		for _, p := range entry.peers {
-			peerId := c.getId(p)
-			if peerId == c.localId {
+			id := c.getId(p)
+			if id == c.localId {
 				continue
 			}
-			if _, found := c.neighborhood[peerId]; !found {
-				candidates = append(candidates, p)
+			if _, found := c.neighborhood[id]; !found {
+				count++
+				if rand.Intn(count) == 0 {
+					candidate = p
+					foundCandidate = true
+				}
 			}
 		}
 	}
 
-	if len(candidates) > 0 {
-		return candidates[rand.Intn(len(candidates))]
+	if foundCandidate {
+		return candidate
 	}
 
-	var zero T
+	var zero T // Return zero value if no candidates were found
 	return zero
 }
 
@@ -129,18 +137,23 @@ func (c *connectionAdvisor[I, T]) GetRedundantPeerSuggestion() *I {
 	delete(count, c.localId)
 
 	var maxCount int
-	var maxPeer I
+	var maxPeers []I // Changed to a slice to handle ties
 	for peer, c := range count {
 		if c > maxCount {
 			maxCount = c
-			maxPeer = peer
+			maxPeers = maxPeers[:0] // Reset slice
+			maxPeers = append(maxPeers, peer)
+		} else if c == maxCount && maxCount > 0 {
+			maxPeers = append(maxPeers, peer)
 		}
 	}
 
-	if maxCount == 0 {
+	if len(maxPeers) == 0 {
 		return nil
 	}
-	return &maxPeer
+	// Randomly select one from the most redundant peers to avoid deterministic behavior
+	selectedPeer := maxPeers[rand.Intn(len(maxPeers))]
+	return &selectedPeer
 }
 
 func (c *connectionAdvisor[I, T]) UpdatePeers(peer I, peers []T) {

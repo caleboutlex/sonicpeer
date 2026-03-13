@@ -138,7 +138,6 @@ func (c *backendClient) NodeProgressLoop(stop <-chan struct{}, wg *sync.WaitGrou
 				continue
 			}
 			c.progress.Store(p)
-
 		case <-stop:
 			return
 		}

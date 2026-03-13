@@ -10,8 +10,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -43,10 +41,6 @@ import (
 	"github.com/0xsoniclabs/sonic/utils/caution"
 )
 
-// =============================== Sync.Pool ================================ //
-
-// ======================================================================//
-
 const (
 	softResponseLimitSize = 2 * 1024 * 1024    // Target maximum size of returned events, or other data.
 	softLimitItems        = 250                // Target maximum number of events or transactions to request/response
@@ -58,6 +52,36 @@ const (
 
 	TxTurnNonces = 32
 )
+
+var txHashesBufPool = sync.Pool{
+	New: func() interface{} {
+		return make([]common.Hash, 0, 1024)
+	},
+}
+
+var eventIDsBufPool = sync.Pool{
+	New: func() interface{} {
+		return make(hash.Events, 0, 1024)
+	},
+}
+
+var eventBufPool = sync.Pool{
+	New: func() interface{} {
+		return make(inter.EventPayloads, 0, 1024)
+	},
+}
+
+var txBufPool = sync.Pool{
+	New: func() interface{} {
+		return make(types.Transactions, 0, 1024)
+	},
+}
+
+var peerSlicePool = sync.Pool{
+	New: func() interface{} {
+		return make([]*peer, 0, 128)
+	},
+}
 
 func errResp(code errCode, format string, v ...interface{}) error {
 	return fmt.Errorf("%v - %v", code, fmt.Sprintf(format, v...))
@@ -95,7 +119,7 @@ type handlerConfig struct {
 
 	localId             enode.ID
 	localEndPointSource LocalEndPointSource
-	searcherHook        SearcherHook
+	searcherHook        searcherHook
 }
 
 type LocalEndPointSource interface {
@@ -104,7 +128,7 @@ type LocalEndPointSource interface {
 
 // SearcherHook is a function that gets a "first look" at a transaction.
 // It should be zero-copy and non-blocking.
-type SearcherHook func(tx *types.Transaction)
+type searcherHook func(tx *types.Transaction)
 
 // handler is a lightweight P2P Handler that gossips transactions
 // and events without maintaining local state or participating in consensus.
@@ -177,8 +201,6 @@ type handler struct {
 	txHashCache  *wlru.Cache
 	eventIDCache *wlru.Cache
 
-	searcherHook SearcherHook
-
 	trackedEpoch atomic.Uint64
 }
 
@@ -223,8 +245,6 @@ func newHandler(c handlerConfig) (*handler, error) {
 
 		txHashCache:  txHashCache,
 		eventIDCache: eventIDCache,
-
-		searcherHook: c.searcherHook,
 	}
 
 	if epoch := backend.GetEpoch(); epoch != 0 {
@@ -281,12 +301,6 @@ func (h *handler) Start(maxPeers int) {
 	backendProgressStopChanel := make(chan struct{})
 	h.backendProgressStop = backendProgressStopChanel
 	go h.backend.NodeProgressLoop(backendProgressStopChanel, &h.loopsWg)
-
-	// Start the stats loop
-	h.loopsWg.Add(1)
-	statsStopChannel := make(chan struct{})
-	h.statsStop = statsStopChannel
-	go h.printStatsLoop(statsStopChannel)
 
 	// Load persisted peers
 	h.loadPeers()
@@ -351,27 +365,13 @@ func (h *handler) checkNewEpoch() uint64 {
 	return currentEpoch
 }
 
-func (h *handler) highestPeerProgress() PeerProgress {
-	peers := peerSlicePool.Get().([]*peer)
-	peers = h.peers.ListTo(peers[:0])
-	defer peerSlicePool.Put(peers)
-	max := h.myProgress()
-	for _, peer := range peers {
-		peerProgress := peer.GetProgress()
-		if max.LastBlockIdx < peerProgress.LastBlockIdx {
-			max = peerProgress
-		}
-	}
-	return max
-}
-
 // isUseless checks if the peer is banned from discovery and ban it if it should be
 func isUseless(node *enode.Node, name string) bool {
 	return discfilter.Banned(node.ID(), node.Record())
 }
 
 // handle is the callback invoked to manage the life cycle of a peer.
-func (h *handler) handle(p *peer) error {
+func (h *handler) handle(p *peer) (err error) {
 	p.Log().Trace("Connecting peer", "peer", p.ID(), "name", p.Name())
 
 	useless := isUseless(p.Node(), p.Name())
@@ -415,18 +415,9 @@ func (h *handler) handle(p *peer) error {
 	}
 	defer h.unregisterPeer(p.id)
 
-	// Collect metadata (GeoIP, etc.)
-	go p.CollectMetadata()
-
-	// Speed up discovery: Ask for peers immediately upon connection
-	go func() {
-		if err := p.SendEndPointUpdateRequest(); err != nil {
-			p.Log().Debug("Failed to send end-point update request", "err", err)
-		}
-		if err := p.SendPeerInfoRequest(); err != nil {
-			p.Log().Debug("Failed to send peer info request", "err", err)
-		}
-	}()
+	if err := p.SendEndPointUpdateRequest(); err != nil {
+		p.Log().Debug("Failed to send end-point update request", "err", err)
+	}
 
 	// Handle incoming messages until the connection is torn down
 	for {
@@ -489,7 +480,9 @@ func (h *handler) handleTxHashes(p *peer, announces []common.Hash, receivedAt ti
 		}
 	}
 	// Schedule all the unknown hashes for retrieval
-	p.RequestTransactions(toRequest)
+	if err := p.RequestTransactions(toRequest); err != nil {
+		p.Log().Warn("Failed to request transactions", "err", err)
+	}
 	return
 }
 
@@ -520,6 +513,9 @@ func (h *handler) handleEventHashes(p *peer, announces hash.Events, receivedAt t
 		}
 	}
 	p.RequestEvents(toRequest)
+	if err := p.RequestEvents(toRequest); err != nil {
+		p.Log().Warn("Failed to request events", "err", err)
+	}
 }
 
 func (h *handler) handleEvents(p *peer, events dag.Events, ordered bool, receivedAt time.Time) {
@@ -538,7 +534,6 @@ func (h *handler) handleEvents(p *peer, events dag.Events, ordered bool, receive
 		if !h.eventIDCache.Contains(id) {
 			h.eventIDCache.Add(id, struct{}{}, 1)
 		}
-		// Resolve the race mathematically
 	}
 	// Sonicpeer: Do nothing, cause we are not interrested in relaying events....
 }
@@ -707,11 +702,7 @@ func (h *handler) handleMsg(p *peer) error {
 		reportedPeers := []*enode.Node{}
 		for _, info := range infos.Peers {
 			var enode enode.Node
-			s := info.Enode
-			if strings.HasPrefix(s, "menode://") {
-				s = strings.Replace(s, "menode://", "enode://", 1)
-			}
-			if err := enode.UnmarshalText([]byte(s)); err != nil {
+			if err := enode.UnmarshalText([]byte(info.Enode)); err != nil {
 				h.Log.Debug("Failed to unmarshal enode", "enode", info.Enode, "err", err)
 			} else {
 				reportedPeers = append(reportedPeers, &enode)
@@ -743,10 +734,8 @@ func (h *handler) handleMsg(p *peer) error {
 		if err := rlp.DecodeBytes(blob, &encoded); err != nil {
 			return errResp(ErrDecode, "%v: %v", msg, err)
 		}
+
 		var enode enode.Node
-		if strings.HasPrefix(encoded, "menode://") {
-			encoded = strings.Replace(encoded, "menode://", "enode://", 1)
-		}
 		if err := enode.UnmarshalText([]byte(encoded)); err != nil {
 			h.Log.Debug("Failed to unmarshal enode", "enode", encoded, "err", err)
 		} else {
@@ -755,8 +744,6 @@ func (h *handler) handleMsg(p *peer) error {
 				timestamp: time.Now(),
 			})
 		}
-		p.ConfirmEndPointUpdate()
-
 	default:
 		return errResp(ErrInvalidMsgCode, "%v", msg.Code)
 	}
@@ -766,30 +753,6 @@ func (h *handler) handleMsg(p *peer) error {
 func (h *handler) decideBroadcastAggressiveness(size int, passed time.Duration, peersNum int) int {
 	// MEV: Always broadcast to everyone immediately to ensure maximum propagation speed.
 	return peersNum
-}
-
-var txHashesBufPool = sync.Pool{
-	New: func() interface{} {
-		return make([]common.Hash, 0, 1024)
-	},
-}
-
-var eventIDsBufPool = sync.Pool{
-	New: func() interface{} {
-		return make(hash.Events, 0, 1024)
-	},
-}
-
-var txBufPool = sync.Pool{
-	New: func() interface{} {
-		return make(types.Transactions, 0, 1024)
-	},
-}
-
-var peerSlicePool = sync.Pool{
-	New: func() interface{} {
-		return make([]*peer, 0, 128)
-	},
 }
 
 // BroadcastTxs will propagate a batch of transactions to all peers which are not known to
@@ -835,12 +798,6 @@ func (h *handler) BroadcastTx(tx *types.Transaction) {
 	for _, p := range peers {
 		p.AsyncSendTransactions(txs, p.queue)
 	}
-}
-
-var eventBufPool = sync.Pool{
-	New: func() interface{} {
-		return make(inter.EventPayloads, 0, 1024)
-	},
 }
 
 // BroadcastEvents will propagate a batch of events to all peers which are not known to
@@ -892,9 +849,12 @@ func (h *handler) peerInfoCollectionLoop(stop <-chan struct{}) {
 
 	collect := func() {
 		// Get a suggestion for a new peer.
-		// Speed up discovery: Suggest multiple peers per tick
+		// The number of suggestions to fetch is a trade-off between discovery speed and network load.
+		// The original value of 64 was highly aggressive and could lead to excessive connection attempts.
+		// A smaller number like 8 reduces network chatter and connection churn, while still ensuring
+		// a steady stream of new potential peers.
 		suggested := make(map[string]struct{})
-		for i := 0; i < 64; i++ {
+		for i := 0; i < 8; i++ {
 			suggestion := h.connectionAdvisor.GetNewPeerSuggestion()
 			if suggestion == nil {
 				break
@@ -966,66 +926,8 @@ func (h *handler) peerInfoCollectionLoop(stop <-chan struct{}) {
 	}
 }
 
-func (h *handler) printStatsLoop(stop <-chan struct{}) {
-	ticker := time.NewTicker(10 * time.Second)
-	geoTicker := time.NewTicker(1 * time.Minute)
-	defer ticker.Stop()
-	defer geoTicker.Stop()
-	defer h.loopsWg.Done()
-	for {
-		select {
-		case <-ticker.C:
-			peers := peerSlicePool.Get().([]*peer)
-			peers = h.peers.ListTo(peers[:0])
-			inbound, outbound, trusted := 0, 0, 0
-			for _, p := range peers {
-				if p.Peer.Inbound() {
-					inbound++
-				} else {
-					outbound++
-				}
-				if p.Peer.Info().Network.Trusted {
-					trusted++
-				}
-			}
-			peerSlicePool.Put(peers)
-
-			h.Log.Info("Peer stats",
-				"total", h.peers.Len(),
-				"inbound", inbound,
-				"outbound", outbound,
-				"trusted", trusted,
-				"useless", h.peers.UselessNum(),
-			)
-		case <-geoTicker.C:
-			//go h.logPeerGeoDistribution()
-		case <-stop:
-			return
-		}
-	}
-}
-
-func (h *handler) logPeerGeoDistribution() {
-	peers := peerSlicePool.Get().([]*peer)
-	peers = h.peers.ListTo(peers[:0])
-	defer peerSlicePool.Put(peers)
-	if len(peers) == 0 {
-		return
-	}
-
-	stats := make(map[string]int)
-	for _, p := range peers {
-		if meta := p.GetMetadata(); meta != nil && meta.Geo.CountryCode != "" {
-			stats[meta.Geo.CountryCode]++
-		}
-	}
-
-	h.Log.Info("Peer Geographical Distribution", "stats", stats)
-}
-
 type persistedPeer struct {
-	Enode    string        `json:"enode"`
-	Metadata *PeerMetadata `json:"metadata"`
+	Enode string `json:"enode"`
 }
 
 func (h *handler) savePeers() {
@@ -1033,46 +935,23 @@ func (h *handler) savePeers() {
 		return
 	}
 
-	// Load existing peers from disk to preserve them
-	knownPeers := make(map[string]persistedPeer)
 	path := filepath.Join(h.dataDir, "nodes.json")
-	if data, err := os.ReadFile(path); err == nil {
-		var existing []persistedPeer
-		if err := json.Unmarshal(data, &existing); err == nil {
-			for _, p := range existing {
-				knownPeers[p.Enode] = p
-			}
-		} else {
-			// Try legacy format
-			var legacyNodes []string
-			if errLegacy := json.Unmarshal(data, &legacyNodes); errLegacy == nil {
-				for _, n := range legacyNodes {
-					knownPeers[n] = persistedPeer{Enode: n}
-				}
-			}
-		}
-	}
 
 	peers := peerSlicePool.Get().([]*peer)
 	peers = h.peers.ListTo(peers[:0])
 	defer peerSlicePool.Put(peers)
 
+	nodes := make([]persistedPeer, 0, len(peers))
 	for _, p := range peers {
 		if n := p.Node(); n != nil {
-			knownPeers[n.String()] = persistedPeer{
-				Enode:    n.String(),
-				Metadata: p.GetMetadata(),
-			}
+			nodes = append(nodes, persistedPeer{
+				Enode: n.String(),
+			})
 		}
 	}
 
-	if len(knownPeers) == 0 {
+	if len(nodes) == 0 {
 		return
-	}
-
-	nodes := make([]persistedPeer, 0, len(knownPeers))
-	for _, p := range knownPeers {
-		nodes = append(nodes, p)
 	}
 
 	// Use MarshalIndent for better readability of the JSON file
@@ -1085,7 +964,7 @@ func (h *handler) savePeers() {
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		h.Log.Warn("Failed to save peers", "err", err)
 	} else {
-		h.Log.Info("Saved peers to disk", "count", len(nodes))
+		h.Log.Info("Saved connected peers to disk", "count", len(nodes))
 	}
 }
 
@@ -1101,30 +980,11 @@ func (h *handler) loadPeers() {
 
 	var nodes []persistedPeer
 	if err := json.Unmarshal(data, &nodes); err != nil {
-		// Try legacy format (list of strings) for backward compatibility
-		var legacyNodes []string
-		if errLegacy := json.Unmarshal(data, &legacyNodes); errLegacy != nil {
-			h.Log.Warn("Failed to unmarshal peers", "err", err)
-			return
-		}
-		for _, n := range legacyNodes {
-			nodes = append(nodes, persistedPeer{Enode: n})
-		}
+		h.Log.Warn("Failed to unmarshal peers", "err", err)
+		return
 	}
 
 	h.Log.Info("Loaded peers from disk", "count", len(nodes))
-
-	// Sort nodes by recency (newest first) to prioritize active peers
-	sort.Slice(nodes, func(i, j int) bool {
-		var t1, t2 time.Time
-		if nodes[i].Metadata != nil {
-			t1 = nodes[i].Metadata.ConnectedAt
-		}
-		if nodes[j].Metadata != nil {
-			t2 = nodes[j].Metadata.ConnectedAt
-		}
-		return t1.After(t2)
-	})
 
 	go func() {
 		for _, p := range nodes {

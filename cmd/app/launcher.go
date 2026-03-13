@@ -61,6 +61,22 @@ var appFlags = []cli.Flag{
 	flags.WSAllowedOriginsFlag,
 	flags.WSPathPrefixFlag,
 	flags.IPCDisabledFlag,
+
+	// Metrics and Profiling flags
+	cli.BoolFlag{
+		Name:  "metrics",
+		Usage: "Enable metrics collection and reporting",
+	},
+	cli.StringFlag{
+		Name:  "metrics.addr",
+		Usage: "Listening address for the metrics server",
+		Value: "127.0.0.1",
+	},
+	cli.IntFlag{
+		Name:  "metrics.port",
+		Usage: "Listening port for the metrics server",
+		Value: 6060,
+	},
 }
 
 func initApp() *cli.App {
@@ -115,6 +131,9 @@ func sentryMainInternal(ctx *cli.Context, control *AppControl) error {
 		WSAllowedOrigins: splitAndTrim(ctx.GlobalString(flags.WSAllowedOriginsFlag.Name)),
 		WSPathPrefix:     ctx.GlobalString(flags.WSPathPrefixFlag.Name),
 		IPCDisabled:      ctx.GlobalBool(flags.IPCDisabledFlag.Name),
+		MetricsEnabled:   ctx.GlobalBool("metrics"),
+		MetricsAddr:      ctx.GlobalString("metrics.addr"),
+		MetricsPort:      ctx.GlobalInt("metrics.port"),
 		GossipConfig:     gossipCfg,
 	}
 

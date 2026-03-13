@@ -1,22 +1,7 @@
-// Copyright 2025 Sonic Operations Ltd
-// This file is part of the Sonic Client
-//
-// Sonic is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Lesser General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// Sonic is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Lesser General Public License for more details.
-//
-// You should have received a copy of the GNU Lesser General Public License
-// along with Sonic. If not, see <http://www.gnu.org/licenses/>.
-
 package gossip
 
 import (
+	"fmt"
 	"math/big"
 
 	"github.com/Fantom-foundation/lachesis-base/hash"
@@ -95,6 +80,42 @@ const (
 	// Contains the enode including the public end-point of the sender.
 	EndPointUpdateMsg = 13
 )
+
+// MsgCodeToString converts a protocol message code to a human-readable string.
+func MsgCodeToString(code uint64) string {
+	switch code {
+	case HandshakeMsg:
+		return "Handshake"
+	case ProgressMsg:
+		return "Progress"
+	case EvmTxsMsg:
+		return "EvmTxs"
+	case NewEvmTxHashesMsg:
+		return "NewEvmTxHashes"
+	case GetEvmTxsMsg:
+		return "GetEvmTxs"
+	case NewEventIDsMsg:
+		return "NewEventIDs"
+	case GetEventsMsg:
+		return "GetEvents"
+	case EventsMsg:
+		return "Events"
+	case RequestEventsStream:
+		return "RequestEventsStream"
+	case EventsStreamResponse:
+		return "EventsStreamResponse"
+	case GetPeerInfosMsg:
+		return "GetPeerInfos"
+	case PeerInfosMsg:
+		return "PeerInfos"
+	case GetEndPointMsg:
+		return "GetEndPoint"
+	case EndPointUpdateMsg:
+		return "EndPointUpdate"
+	default:
+		return fmt.Sprintf("Unknown(0x%02x)", code)
+	}
+}
 
 type errCode int
 

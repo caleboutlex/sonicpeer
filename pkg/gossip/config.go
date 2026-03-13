@@ -123,6 +123,11 @@ type (
 		MaxNonFlushedSize   int
 		MaxNonFlushedPeriod time.Duration
 	}
+
+	MetricsConfig struct {
+		Enabled bool   `json:"enabled"`
+		Addr    string `json:"addr"`
+	}
 )
 
 type PeerCacheConfig struct {
@@ -187,7 +192,7 @@ func DefaultConfig(scale cachescale.Func) Config {
 			MaxRandomTxHashesSend:    250, // match softLimitItems to fit into one message
 			RandomTxHashesSendPeriod: 1 * time.Second,
 			PeerInfoCollectionPeriod: 1 * time.Second,
-			PeerEndPointUpdatePeriod: 1 * time.Minute,
+			PeerEndPointUpdatePeriod: 5 * time.Minute,
 			PeerCache:                DefaultPeerCacheConfig(scale),
 		},
 

@@ -1,28 +1,9 @@
-// Copyright 2025 Sonic Operations Ltd
-// This file is part of the Sonic Client
-//
-// Sonic is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Lesser General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// Sonic is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Lesser General Public License for more details.
-//
-// You should have received a copy of the GNU Lesser General Public License
-// along with Sonic. If not, see <http://www.gnu.org/licenses/>.
-
 package gossip
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
-	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -65,30 +46,6 @@ type PeerInfo struct {
 	NumOfBlocks idx.Block `json:"blocks"`
 }
 
-type GeoInfo struct {
-	CountryCode string  `json:"countryCode"`
-	Country     string  `json:"country"`
-	City        string  `json:"city"`
-	Lat         float64 `json:"lat"`
-	Lon         float64 `json:"lon"`
-	ISP         string  `json:"isp"`
-	Query       string  `json:"query"`
-}
-
-type PeerMetadata struct {
-	IP            string
-	Name          string
-	Version       uint
-	ClientVersion string
-	Capabilities  string
-	Inbound       bool
-	Trusted       bool
-	Static        bool
-	ConnectedAt   time.Time
-	Latency       time.Duration
-	Geo           GeoInfo
-}
-
 var bufPool = sync.Pool{
 	New: func() interface{} {
 		return new(bytes.Buffer)
@@ -102,33 +59,20 @@ type broadcastItem struct {
 }
 
 type peer struct {
-	id string
-
-	cfg PeerCacheConfig
-
 	*p2p.Peer
-	rw p2p.MsgReadWriter
-
-	version uint // Protocol version negotiated
-
+	id                  string
+	cfg                 PeerCacheConfig
+	rw                  p2p.MsgReadWriter
+	version             uint               // Protocol version negotiated
 	knownTxs            *txCache           // Set of transaction hashes known to be known by this peer
 	knownEvents         *eventCache        // Set of event hashes known to be known by this peer
 	queue               chan broadcastItem // queue of items to send
 	queuedDataSemaphore *datasemaphore.DataSemaphore
 	term                chan struct{} // Termination channel to stop the broadcaster
-
-	progress PeerProgress
-
-	useless uint32
-
+	progress            PeerProgress
+	useless             uint32
+	endPoint            atomic.Pointer[peerEndPointInfo]
 	sync.RWMutex
-
-	endPoint atomic.Pointer[peerEndPointInfo]
-
-	metadata atomic.Pointer[PeerMetadata]
-
-	created   time.Time
-	pingStart time.Time
 }
 
 type peerEndPointInfo struct {
@@ -189,12 +133,15 @@ func newPeer(version uint, p *p2p.Peer, rw p2p.MsgReadWriter, cfg PeerCacheConfi
 		queue:               make(chan broadcastItem, cfg.MaxQueuedItems),
 		queuedDataSemaphore: datasemaphore.New(dag.Metric{Num: cfg.MaxQueuedItems, Size: cfg.MaxQueuedSize}, getSemaphoreWarningFn("Peers queue")),
 		term:                make(chan struct{}),
-		created:             time.Now(),
 	}
 
 	go peer.broadcast(peer.queue)
 
 	return peer
+}
+
+func (p *peer) Send(msgCode uint64, data rlp.RawValue) error {
+	return p2p.Send(p.rw, msgCode, data)
 }
 
 // broadcast is a write loop that multiplexes event propagations, announcements
@@ -225,83 +172,11 @@ func (p *peer) Close() {
 
 // CollectMetadata fetches the geo location of the peer and other interesting metadata.
 func (p *peer) CollectMetadata() {
-	if p.metadata.Load() != nil {
-		return
-	}
-
-	meta := &PeerMetadata{
-		IP:            p.RemoteAddr().String(),
-		Name:          p.Fullname(),
-		ClientVersion: p.Name(),
-		Capabilities:  fmt.Sprintf("%v", p.Caps()),
-		Inbound:       p.Peer.Info().Network.Inbound,
-		Trusted:       p.Peer.Info().Network.Trusted,
-		Static:        p.Peer.Info().Network.Static,
-		ConnectedAt:   p.created,
-	}
-	p.metadata.Store(meta)
-
-	// Fetch GeoIP
-	addr := p.RemoteAddr().String()
-	host, _, err := net.SplitHostPort(addr)
-	if err == nil {
-		client := &http.Client{Timeout: 10 * time.Second}
-		// Retry loop to handle rate limits (429) or network glitches
-		for i := 0; i < 5; i++ {
-			resp, err := client.Get("http://ip-api.com/json/" + host)
-			if err != nil {
-				time.Sleep(time.Duration(i+1) * 2 * time.Second)
-				continue
-			}
-
-			if resp.StatusCode == http.StatusTooManyRequests {
-				resp.Body.Close()
-				time.Sleep(time.Duration(i+1) * 5 * time.Second)
-				continue
-			}
-
-			if resp.StatusCode == http.StatusOK {
-				var geo GeoInfo
-				if err := json.NewDecoder(resp.Body).Decode(&geo); err == nil {
-					// Reload metadata to capture any concurrent updates (e.g. Latency)
-					if current := p.metadata.Load(); current != nil {
-						newMeta := *current
-						newMeta.Geo = geo
-						p.metadata.Store(&newMeta)
-					}
-				}
-				resp.Body.Close()
-				break
-			}
-			resp.Body.Close()
-			break
-		}
-	}
-}
-
-func (p *peer) SetLatency(d time.Duration) {
-	meta := p.metadata.Load()
-	if meta == nil {
-		return
-	}
-	newMeta := *meta
-	newMeta.Latency = d
-	p.metadata.Store(&newMeta)
+	// This functionality has been removed to improve performance.
 }
 
 func (p *peer) ConfirmEndPointUpdate() {
-	p.Lock()
-	start := p.pingStart
-	p.pingStart = time.Time{}
-	p.Unlock()
-
-	if !start.IsZero() {
-		p.SetLatency(time.Since(start))
-	}
-}
-
-func (p *peer) GetMetadata() *PeerMetadata {
-	return p.metadata.Load()
+	// This was used for latency measurement, which has been removed.
 }
 
 // Info gathers and returns a collection of metadata known about a peer.
@@ -893,9 +768,6 @@ func (p *peer) SendEndPointUpdateRequest() error {
 	if !p.RunningCap(ProtocolName, []uint{_Sonic_65}) {
 		return nil
 	}
-	p.Lock()
-	p.pingStart = time.Now()
-	p.Unlock()
 	return p2p.Send(p.rw, GetEndPointMsg, rlp.RawValue{0xc0})
 }
 
