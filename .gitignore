@@ -1,0 +1,23 @@
+# Compiled Object files, Static Libraries, and Executables
+*.o
+*.a
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Go workspace directory
+/vendor/
+
+# Build output
+/build/
+
+# Environment variable files
+.env
