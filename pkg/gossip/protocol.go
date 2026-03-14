@@ -129,6 +129,7 @@ const (
 	ErrNoStatusMsg
 	ErrExtraStatusMsg
 	ErrSuspendedPeer
+	ErrUnSyncedPeer
 	ErrEmptyMessage = 0xf00
 )
 

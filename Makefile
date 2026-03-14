@@ -41,7 +41,7 @@ test:
 	--ws \
 	--ws.addr 0.0.0.0 \
 	--ws.port $(WS_PORT) \
-	--ws.api "eth" \
+	--ws.api "eth,net" \
 
 metrics: 
 	@echo "Running sonicpeer in test mode..."
@@ -56,9 +56,9 @@ metrics:
 	--ws.port $(WS_PORT) \
 	--ws.api "eth" \
 
-sidecar: 
+delta: 
 	@echo "Running sidecar script..."
-	go run .sidecar/main.go
+	go run sidecar/main.go
 
 # sonicpeer: Builds the sonicpeer executable from source and makes it runnable.
 sonicpeer:

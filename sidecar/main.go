@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -38,7 +39,7 @@ var (
 		"ws://localhost:18546",
 	}
 
-	sentryNode = "wss://localhost:8546"
+	sentryNode = "ws://localhost:8546"
 )
 
 type arrival struct {
@@ -53,6 +54,8 @@ var (
 	// Internal counters for terminal reporting
 	sonicOrphanCount    atomic.Uint64
 	standardOrphanCount atomic.Uint64
+	sentryPeerCount     atomic.Int32
+	standardPeerCount   atomic.Int32
 )
 
 func record(hash common.Hash, isSonic bool, cluster string) {
@@ -111,6 +114,17 @@ func subscribe(ctx context.Context, url string, isSonic bool, cluster string) {
 	}
 }
 
+// getPeerCount makes an RPC call to fetch the number of connected peers.
+func getPeerCount(client *rpc.Client, url string) int32 {
+	var count hexutil.Uint
+	if err := client.Call(&count, "net_peerCount"); err != nil {
+		// Log as debug to avoid flooding if a node is temporarily down
+		log.Printf("Failed to fetch peer count from %s: %v", url, err)
+		return -1 // Indicate error
+	}
+	return int32(count)
+}
+
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -125,8 +139,20 @@ func main() {
 	}()
 
 	// Start subscriptions
-	go subscribe(ctx, sentryNode, true, "mainnet") // SonicPeer
+	sentryClient, err := rpc.Dial(sentryNode)
+	if err != nil {
+		log.Fatalf("Failed to connect to Sentry node at %s: %v", sentryNode, err)
+	}
+	go subscribe(ctx, sentryNode, true, "mainnet")
+
+	standardClients := make(map[string]*rpc.Client)
 	for _, url := range standardNodes {
+		client, err := rpc.Dial(url)
+		if err != nil {
+			log.Printf("Failed to connect to standard node at %s: %v", url, err)
+			continue
+		}
+		standardClients[url] = client
 		go subscribe(ctx, url, false, "mainnet")
 	}
 
@@ -137,8 +163,10 @@ func main() {
 			mu.Lock()
 			now := time.Now()
 			tracked := len(seen)
+			// Increase the window to 2 minutes to account for slow propagation
+			// across poorly connected network segments.
 			for h, a := range seen {
-				if now.Sub(a.ts) > 30*time.Second {
+				if now.Sub(a.ts) > 120*time.Second {
 					if a.isSonic {
 						sonicOrphans.Inc()
 						sonicOrphanCount.Add(1)
@@ -149,8 +177,20 @@ func main() {
 					delete(seen, h)
 				}
 			}
-			log.Printf("[STAT] Heartbeat | Sonic Orphans: %d | Std Orphans: %d | Tracking Map: %d",
-				sonicOrphanCount.Load(), standardOrphanCount.Load(), tracked)
+
+			// Fetch and update peer counts
+			sentryPeerCount.Store(getPeerCount(sentryClient, sentryNode))
+			totalStandardPeers := int32(0)
+			for url, client := range standardClients {
+				count := getPeerCount(client, url)
+				if count >= 0 {
+					totalStandardPeers += count
+				}
+			}
+			standardPeerCount.Store(totalStandardPeers)
+
+			log.Printf("[STAT] Heartbeat | Sonic Orphans: %d | Std Orphans: %d | Tracking Map: %d | Sentry Peers: %d | Std Peers: %d",
+				sonicOrphanCount.Load(), standardOrphanCount.Load(), tracked, sentryPeerCount.Load(), standardPeerCount.Load())
 			mu.Unlock()
 		}
 	}()

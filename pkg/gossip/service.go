@@ -19,11 +19,14 @@ import (
 // Service is a lightweight implementation of node.Service that only handles
 // P2P message routing without participating in consensus or maintaining state.
 type Service struct {
-	config              Config
+	config Config
+
+	// server
+	p2pServer *p2p.Server
+	Name      string
+
 	handler             *handler // the P2P protocol handler
 	operaDialCandidates enode.Iterator
-
-	stack *node.Node
 
 	txFeed event.Feed
 	txCh   chan *types.Transaction
@@ -39,7 +42,9 @@ func NewService(stack *node.Node, config Config, datadir string, url string, gen
 		return nil, err
 	}
 
-	svc.stack = stack
+	svc.Name = "Sonic"
+	svc.p2pServer = stack.Server()
+
 	return svc, nil
 }
 
@@ -48,7 +53,7 @@ type localEndPointSource struct {
 }
 
 func (s localEndPointSource) GetLocalEndPoint() *enode.Node {
-	return s.service.stack.Server().LocalNode().Node()
+	return s.service.p2pServer.Self()
 }
 
 func newService(config Config, localId enode.ID, networkId uint64, genisis common.Hash, url string, datadir string) (*Service, error) {
@@ -167,14 +172,19 @@ func (s *Service) APIs() []rpc.API {
 			Service:   NewPublicAPI(&s.txFeed, s.handler),
 			Public:    true,
 		},
+		{
+			Namespace: "net",
+			Version:   "1.0",
+			Service:   NewPublicNetAPI(s.p2pServer, s.handler.networkID),
+			Public:    true,
+		},
 	}
 }
 
 // Start is called after all services have been constructed and the networking
 // layer was also started to allow the service to start doing its work.
 func (s *Service) Start() error {
-	srv := s.stack.Server()
-	s.handler.Start(srv.MaxPeers)
+	s.handler.Start(s.p2pServer.MaxPeers)
 
 	// Start the transaction feed pump
 	go func() {
@@ -183,7 +193,8 @@ func (s *Service) Start() error {
 			case tx := <-s.txCh:
 				// Use a non-blocking send or a goroutine to prevent a slow RPC
 				// subscriber from stalling the entire P2P sniffing pipeline.
-				go s.txFeed.Send(tx)
+				s.txFeed.Send(tx)
+
 			case <-s.handler.quitSync:
 				return
 			}

@@ -85,7 +85,7 @@ type newTxsHook func(tx *types.Transaction)
 // It acts as a proxy for a trusted backend full node.
 type handler struct {
 	// ============= Sonic Node ================= //
-	NetworkID uint64
+	networkID uint64
 	config    Config
 	dataDir   string
 
@@ -121,6 +121,7 @@ type handler struct {
 	localEndPointSource LocalEndPointSource
 	newTxsHook          newTxsHook
 	signer              types.Signer
+	minGasPrice         *big.Int
 
 	logger.Instance
 
@@ -154,7 +155,7 @@ func newHandler(c handlerConfig) (*handler, error) {
 	}
 
 	h := &handler{
-		NetworkID: c.networkID,
+		networkID: c.networkID,
 		config:    c.config,
 		dataDir:   c.dataDir,
 
@@ -171,6 +172,7 @@ func newHandler(c handlerConfig) (*handler, error) {
 		localEndPointSource: c.localEndPointSource,
 		newTxsHook:          c.newTxsHook,
 		signer:              types.LatestSignerForChainID(new(big.Int).SetUint64(c.networkID)),
+		minGasPrice:         c.config.GPO.MinGasPrice,
 
 		Instance: logger.New("PM"),
 
@@ -305,6 +307,16 @@ func (h *handler) checkNewEpoch() uint64 {
 	return currentEpoch
 }
 
+// PeerCount returns the number of currently connected peers.
+func (h *handler) PeerCount() int {
+	return h.peers.Len()
+}
+
+// NetworkID returns the network ID the handler is configured for.
+func (h *handler) NetworkID() uint64 {
+	return h.networkID
+}
+
 // isUseless checks if the peer is banned from discovery and ban it if it should be
 func isUseless(node *enode.Node, name string) bool {
 	return discfilter.Banned(node.ID(), node.Record())
@@ -334,7 +346,7 @@ func (h *handler) handle(p *peer) (err error) {
 		myProgress = h.myProgress()
 	)
 
-	if err := p.Handshake(h.NetworkID, myProgress, common.Hash(genesis)); err != nil {
+	if err := p.Handshake(h.networkID, myProgress, common.Hash(genesis)); err != nil {
 		p.Log().Error("Handshake failed", "err", err, "peer", p.ID(), "name", p.Name())
 		if !useless {
 			discfilter.Ban(p.ID())
@@ -406,9 +418,16 @@ func (h *handler) handleTxs(p *peer, txs types.Transactions, receivedAt time.Tim
 		p.MarkTransaction(id)
 
 		if !h.txHashCache.Contains(id) {
-			// LIGHTWEIGHT VALIDATION:
-			// Verify the signature and ChainID. This filters out spam and
-			// transactions from other networks (e.g. Ethereum/Fantom).
+			// VALIDATION:
+			// 1. Check if the gas price meets our minimum requirement to match
+			// the mempool policy of a standard full node.
+			if tx.GasPrice().Cmp(h.minGasPrice) < 0 {
+				p.Log().Warn("Invalid transaction", "err", "gas price too low", "hash", id)
+				continue
+			}
+
+			// 2. Verify the signature and ChainID. This filters out spam and
+			// transactions from other networks.
 			if _, err := types.Sender(h.signer, tx); err != nil {
 				p.Log().Warn("Invalid transaction", "err", err, "hash", id)
 				continue
@@ -495,6 +514,10 @@ func (h *handler) handleMsg(p *peer) error {
 		if err := msg.Decode(&progress); err != nil {
 			return errResp(ErrDecode, "%v: %v", msg, err)
 		}
+
+		if err := h.checkPeerStaleness(p, progress); err != nil {
+			return err
+		}
 		p.SetProgress(progress)
 
 	case EvmTxsMsg:
@@ -538,17 +561,13 @@ func (h *handler) handleMsg(p *peer) error {
 		// Sonicpeer: We dont want to waste bandwith so we skip this and just return nil
 
 	case GetPeerInfosMsg:
-		// Sonicpeer: We prioritize bandwidth and CPU for transaction discovery.
-		// We choose not to respond to peerlist requests to remain as fast as possible.
-		return nil
+		// Sonicpeer: We dont want to waste bandwith so we skip this and just return nil
 
 	case PeerInfosMsg:
 		var infos peerInfoMsg
 		if err := msg.Decode(&infos); err != nil {
 			return errResp(ErrDecode, "%v: %v", msg, err)
 		}
-
-		//h.Log.Info("Received peer infos", "count", len(infos.Peers), "peer", p.id)
 
 		reportedPeers := []*enode.Node{}
 		for _, info := range infos.Peers {
@@ -597,6 +616,38 @@ func (h *handler) handleMsg(p *peer) error {
 
 	default:
 		return errResp(ErrInvalidMsgCode, "%v", msg.Code)
+	}
+	return nil
+}
+
+// checkPeerStaleness verifies if a peer's reported epoch matches the local epoch.
+// If they don't match, it tracks the duration of the mismatch and disconnects
+// the peer if it exceeds the configured grace period.
+func (h *handler) checkPeerStaleness(p *peer, progress PeerProgress) error {
+	currentEpoch := h.backend.GetEpoch()
+	if progress.Epoch != currentEpoch {
+		if h.config.Protocol.PeerStaleEpochGracePeriod > 0 {
+			staleSince := p.staleSince
+			if staleSince.IsZero() {
+				p.Lock()
+				if p.staleSince.IsZero() {
+					p.staleSince = time.Now()
+				}
+				staleSince = p.staleSince
+				p.Unlock()
+			}
+
+			staleDuration := time.Since(staleSince)
+			if staleDuration > h.config.Protocol.PeerStaleEpochGracePeriod {
+				p.Disconnect(p2p.DiscUselessPeer)
+				return errResp(ErrUnSyncedPeer, "peer epoch %d != local epoch %d for %v", progress.Epoch, currentEpoch, staleDuration)
+			}
+		}
+	} else if !p.staleSince.IsZero() {
+		// Optimization: only lock if the peer was previously marked as stale.
+		p.Lock()
+		p.staleSince = time.Time{}
+		p.Unlock()
 	}
 	return nil
 }
@@ -951,7 +1002,7 @@ type NodeInfo struct {
 // NodeInfo retrieves some protocol metadata about the running host node.
 func (h *handler) NodeInfo() *NodeInfo {
 	return &NodeInfo{
-		Network:     h.NetworkID,
+		Network:     h.networkID,
 		Genesis:     h.genesis,
 		Epoch:       h.backend.NodeProgress().Epoch,
 		NumOfBlocks: h.backend.NodeProgress().LastBlockIdx,

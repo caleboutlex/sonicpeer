@@ -2,9 +2,12 @@ package gossip
 
 import (
 	"context"
+	"fmt"
 
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/event"
+	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/rpc"
 )
 
@@ -16,7 +19,7 @@ type TransactionBroadcaster interface {
 // PublicAPI provides an API to subscribe to new transactions.
 type PublicAPI struct {
 	feed *event.Feed
-	p2p  TransactionBroadcaster
+	p2p  TransactionBroadcaster // This is actually the handler, which also implements PeerCounter
 }
 
 // NewPublicAPI creates a new API.
@@ -35,7 +38,7 @@ func (api *PublicAPI) NewPendingTransactions(ctx context.Context) (*rpc.Subscrip
 	rpcSub := notifier.CreateSubscription()
 
 	// Create a channel for the feed updates
-	txCh := make(chan *types.Transaction, 4096)
+	txCh := make(chan *types.Transaction, 16384)
 	sub := api.feed.Subscribe(txCh)
 
 	go func() {
@@ -67,7 +70,7 @@ func (api *PublicAPI) NewFullPendingTransactions(ctx context.Context) (*rpc.Subs
 	rpcSub := notifier.CreateSubscription()
 
 	// Create a channel for the feed updates
-	txCh := make(chan *types.Transaction, 4096)
+	txCh := make(chan *types.Transaction, 16384)
 	sub := api.feed.Subscribe(txCh)
 
 	go func() {
@@ -86,4 +89,30 @@ func (api *PublicAPI) NewFullPendingTransactions(ctx context.Context) (*rpc.Subs
 	}()
 
 	return rpcSub, nil
+}
+
+// PublicNetAPI offers network related RPC methods
+type PublicNetAPI struct {
+	net            *p2p.Server
+	networkVersion uint64
+}
+
+// NewPublicNetAPI creates a new net API instance.
+func NewPublicNetAPI(net *p2p.Server, networkVersion uint64) *PublicNetAPI {
+	return &PublicNetAPI{net, networkVersion}
+}
+
+// Listening returns an indication if the node is listening for network connections.
+func (s *PublicNetAPI) Listening() bool {
+	return true // always listening
+}
+
+// PeerCount returns the number of connected peers
+func (s *PublicNetAPI) PeerCount() hexutil.Uint {
+	return hexutil.Uint(s.net.PeerCount())
+}
+
+// Version returns the current ethereum protocol version.
+func (s *PublicNetAPI) Version() string {
+	return fmt.Sprintf("%d", s.networkVersion)
 }
