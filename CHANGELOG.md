@@ -1,26 +1,20 @@
 # Changelog - March 14, 2026
 
 ## [Architectural Improvements]
-- **Fast-Track Discovery**: Refactored `handler.go` to process transaction and hash announcements *before* acquiring the global message semaphore. This eliminated 60s+ latency spikes during network bursts.
-- **Decoupled Metrics**: Centralized Prometheus collectors into `internal/metrics.go` and isolated sidecar metrics to keep business logic clean.
-- **Resource Optimization**: Removed all `sync.Pool` and `bufPool` implementations in `handler.go` and `peer.go` in favor of direct allocations, simplifying memory management for modern Go runtimes.
+- **Fast-Track Discovery**: Transaction and Hash messages now bypass the global semaphore, enabling "wire-speed" discovery independent of network load.
+- **Clean Resource Management**: Removed legacy `sync.Pool` and `bufPool` implementations in favor of modern Go direct allocations, reducing complexity.
+- **Lightweight Sentry Validation**: Implemented Signature (ECDSA) and `MinGasPrice` filtering. This ensures discovery metrics are "clean" and match standard mempool policies.
 
 ## [Connectivity & Discovery]
-- **Aggressive Peering**: Increased discovery candidate throughput from 8 to 32 and reduced collection periods from 60s to 5s.
-- **Topology Persistence**: Updated `savePeers` to persist every discovered `enode` to `nodes.json`, enabling a "warm-start" capability that saturates connection slots instantly on restart.
-- **Smart Maintenance**: Implemented immediate peer-list requests for new connections and a random-subset maintenance loop to reduce network chatter.
-- **Stealth Mode**: Configured the node to ignore `GetPeerInfosMsg` and `GetEvmTxsMsg` to preserve outbound bandwidth for critical transaction propagation.
+- **Aggressive Discovery**: Increased candidate dial throughput (8 -> 32) and increased collection frequency (60s -> 5s).
+- **Topology Persistence**: Discovered nodes are now merged with connected peers and persisted to `nodes.json` for rapid "warm-start" connectivity.
+- **Smart Neighborhood Maintenance**: Refactored peer-info requests to poll random subsets, reducing outbound noise while maintaining topology awareness.
 
-## [Validation & Reliability]
-- **Lightweight Sentry Validation**: Added `types.Sender` (Signature/ChainID) and `MinGasPrice` filtering. This ensures the Sentry only records valid, actionable Sonic transactions, resulting in "clean" discovery metrics.
-- **Epoch Synchronization**: Implemented `checkPeerStaleness` with a configurable grace period to ensure the node only gossips with peers on the correct Epoch.
-- **Lock Optimization**: Optimized the peer synchronization path to use zero-lock "dirty reads" for synced peers, reducing CPU contention.
+## [API & Sidecar]
+- **Standardized net Namespace**: Fully implemented `net_peerCount`, `net_version`, and `net_listening` to comply with standard Ethereum/Sonic RPC expectations.
+- **Standardized eth Subscriptions**: Corrected `newPendingTransactions` and `newFullPendingTransactions` to return standard hex hashes and full objects respectively.
+- **Enhanced Sidecar**: Added peer count monitoring and real-time latency deltas for comparative analysis.
 
-## [API & Monitoring]
-- **Standardized RPC**: Fully implemented the `net` namespace (`net_peerCount`, `net_version`, `net_listening`) and the `eth` subscription namespace (`newPendingTransactions`, `newFullPendingTransactions`).
-- **Sidecar Evolution**: Enhanced the terminal sidecar with real-time latency deltas, orphan tracking, and peer count monitoring for both Sentry and Standard nodes.
-- **Feed Pump**: Instrumented a buffered transaction pump in `Service` to ensure high-frequency P2P discovery doesn't block on slow RPC subscribers.
-
-## [Testing]
-- **Integration Suite**: Created `tests/integration_test.go` to verify Sentry initialization, lifecycle, and RPC subscription functionality.
-- **Unit Test Cleanup**: Streamlined `handler_test.go` by removing redundant benchmarks and focusing on critical DoS protection tests.
+## [Stability]
+- **Epoch Guard**: Implemented an Epoch synchronization check with a zero-lock optimization path for synced peers and a configurable grace period for lagging peers.
+- **Buffered Pump**: Increased internal transaction buffer to 16,384 and implemented a non-blocking feed pump to handle 5k+ tx bursts.
