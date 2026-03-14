@@ -33,6 +33,12 @@ var (
 		Name: "standard_orphans_total",
 		Help: "Total number of transactions seen only by the standard node within the tracking window.",
 	})
+
+	standardNodes []string = []string{
+		"ws://localhost:18546",
+	}
+
+	sentryNode = "wss://localhost:8546"
 )
 
 type arrival struct {
@@ -119,12 +125,7 @@ func main() {
 	}()
 
 	// Start subscriptions
-	// You can add as many standard nodes as you want to the slice below
-	standardNodes := []string{
-		"ws://localhost:18546",
-	}
-
-	go subscribe(ctx, "ws://localhost:8546", true, "mainnet") // SonicPeer
+	go subscribe(ctx, sentryNode, true, "mainnet") // SonicPeer
 	for _, url := range standardNodes {
 		go subscribe(ctx, url, false, "mainnet")
 	}
