@@ -1,7 +1,6 @@
 package gossip
 
 import (
-	"sync"
 	"time"
 
 	"github.com/0xsoniclabs/sonic/logger"
@@ -24,15 +23,10 @@ type Service struct {
 	handler             *handler // the P2P protocol handler
 	operaDialCandidates enode.Iterator
 
-	// ============= Sonicpeer ================= //
-
 	stack *node.Node
-	lock  sync.RWMutex
 
 	txFeed event.Feed
 	txCh   chan *types.Transaction
-
-	quit chan struct{}
 
 	logger.Instance
 }
@@ -61,7 +55,7 @@ func newService(config Config, localId enode.ID, networkId uint64, genisis commo
 	svc := &Service{
 		config:   config,
 		Instance: logger.New("gossip-service"),
-		txCh:     make(chan *types.Transaction, 4096),
+		txCh:     make(chan *types.Transaction, 16384),
 	}
 
 	// init dialCandidates
@@ -72,7 +66,7 @@ func newService(config Config, localId enode.ID, networkId uint64, genisis commo
 		return nil, err
 	}
 
-	searcherHook := func(tx *types.Transaction) {
+	newTxsHook := func(tx *types.Transaction) {
 		select {
 		case svc.txCh <- tx:
 		default:
@@ -92,7 +86,7 @@ func newService(config Config, localId enode.ID, networkId uint64, genisis commo
 
 		localId:             localId,
 		localEndPointSource: localEndPointSource{svc},
-		searcherHook:        searcherHook,
+		newTxsHook:          newTxsHook,
 	})
 	if err != nil {
 		return nil, err
@@ -111,7 +105,8 @@ func (s *Service) Protocols() ([]p2p.Protocol, CleanupFunc) {
 
 // MakeProtocols constructs the P2P protocol definitions for a  sentry node.
 func MakeProtocols(svc *Service, backend *handler, disc enode.Iterator) ([]p2p.Protocol, func()) {
-	mix := enode.NewFairMix(time.Second)
+	// Reduce the timeout from 1s to 100ms to make the dialer more aggressive
+	mix := enode.NewFairMix(100 * time.Millisecond)
 	if disc != nil {
 		mix.AddSource(disc)
 	}
@@ -180,6 +175,20 @@ func (s *Service) APIs() []rpc.API {
 func (s *Service) Start() error {
 	srv := s.stack.Server()
 	s.handler.Start(srv.MaxPeers)
+
+	// Start the transaction feed pump
+	go func() {
+		for {
+			select {
+			case tx := <-s.txCh:
+				// Use a non-blocking send or a goroutine to prevent a slow RPC
+				// subscriber from stalling the entire P2P sniffing pipeline.
+				go s.txFeed.Send(tx)
+			case <-s.handler.quitSync:
+				return
+			}
+		}
+	}()
 	return nil
 }
 
@@ -194,15 +203,4 @@ func (s *Service) Stop() error {
 	// s.feed.Stop()
 
 	return nil
-}
-
-func (s *Service) feedLoop() {
-	for {
-		select {
-		case tx := <-s.txCh:
-			s.txFeed.Send(tx)
-		case <-s.quit:
-			return
-		}
-	}
 }

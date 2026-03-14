@@ -188,13 +188,6 @@ type PeerProgress struct {
 	HighestLamport idx.Lamport
 }
 
-type dagChunk struct {
-	SessionID uint32
-	Done      bool
-	IDs       hash.Events
-	Events    inter.EventPayloads
-}
-
 type peerInfo struct {
 	Enode string
 }

@@ -1,8 +1,6 @@
 package gossip
 
 import (
-	"bytes"
-	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -14,24 +12,12 @@ import (
 	"github.com/Fantom-foundation/lachesis-base/utils/datasemaphore"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/rlp"
 
 	"github.com/0xsoniclabs/sonic/gossip/protocols/dag/dagstream"
 	"github.com/0xsoniclabs/sonic/inter"
-)
-
-var (
-	errNotRegistered = errors.New("peer is not registered")
-)
-
-var (
-	sentTxsPromotedCounter    = metrics.GetOrRegisterCounter("p2p_sent_txs_promoted", nil)
-	droppedTxsPromotedCounter = metrics.GetOrRegisterCounter("p2p_dropped_txs_promoted", nil)
-	sentTxsRequestedCounter   = metrics.GetOrRegisterCounter("p2p_sent_txs_requested", nil)
-	sentTxHashesCounter       = metrics.GetOrRegisterCounter("p2p_sent_tx_hashes", nil)
 )
 
 const (
@@ -46,20 +32,17 @@ type PeerInfo struct {
 	NumOfBlocks idx.Block `json:"blocks"`
 }
 
-var bufPool = sync.Pool{
-	New: func() interface{} {
-		return new(bytes.Buffer)
-	},
-}
-
 type broadcastItem struct {
-	Code uint64
-	Raw  rlp.RawValue
-	buf  *bytes.Buffer
+	Code       uint64
+	Raw        rlp.RawValue
+	ReceivedAt time.Time
+	EnqueuedAt time.Time
 }
 
 type peer struct {
 	*p2p.Peer
+	sync.RWMutex
+
 	id                  string
 	cfg                 PeerCacheConfig
 	rw                  p2p.MsgReadWriter
@@ -72,7 +55,7 @@ type peer struct {
 	progress            PeerProgress
 	useless             uint32
 	endPoint            atomic.Pointer[peerEndPointInfo]
-	sync.RWMutex
+	staleSince          time.Time
 }
 
 type peerEndPointInfo struct {
@@ -153,11 +136,6 @@ func (p *peer) broadcast(queue chan broadcastItem) {
 		case item := <-queue:
 			_ = p2p.Send(p.rw, item.Code, item.Raw)
 			p.queuedDataSemaphore.Release(memSize(item.Raw))
-			if item.buf != nil {
-				item.buf.Reset()
-				bufPool.Put(item.buf)
-			}
-
 		case <-p.term:
 			return
 		}
@@ -210,38 +188,27 @@ func (p *peer) SendTransactionHashes(txids []common.Hash) error {
 	for _, txid := range txids {
 		p.knownTxs.Add(txid)
 	}
-	sentTxHashesCounter.Inc(int64(len(txids)))
 
-	buf := bufPool.Get().(*bytes.Buffer)
-	defer bufPool.Put(buf)
-	buf.Reset()
-
-	// Pre-allocate buffer to avoid resizes
-	// Each hash is 32 bytes + 1 byte RLP prefix.
-	size := len(txids)*33 + 100
-	buf.Grow(size)
-
-	if err := rlp.Encode(buf, txids); err != nil {
+	raw, err := rlp.EncodeToBytes(txids)
+	if err != nil {
 		return err
 	}
-	return p2p.Send(p.rw, NewEvmTxHashesMsg, rlp.RawValue(buf.Bytes()))
+	return p2p.Send(p.rw, NewEvmTxHashesMsg, rlp.RawValue(raw))
 }
 
 func memSize(v rlp.RawValue) dag.Metric {
 	return dag.Metric{Num: 1, Size: uint64(len(v) + 1024)}
 }
 
-func (p *peer) asyncSendEncodedItem(raw rlp.RawValue, code uint64, queue chan broadcastItem, buf *bytes.Buffer) bool {
+func (p *peer) asyncSendEncodedItem(raw rlp.RawValue, code uint64, queue chan broadcastItem) bool {
 	if !p.queuedDataSemaphore.TryAcquire(memSize(raw)) {
-		if buf != nil {
-			bufPool.Put(buf)
-		}
 		return false
 	}
 	item := broadcastItem{
-		Code: code,
-		Raw:  raw,
-		buf:  buf,
+		Code:       code,
+		Raw:        raw,
+		ReceivedAt: time.Now(), // We'll use a specific arrival time in AsyncSendTransactions
+		EnqueuedAt: time.Now(),
 	}
 	select {
 	case queue <- item:
@@ -250,23 +217,18 @@ func (p *peer) asyncSendEncodedItem(raw rlp.RawValue, code uint64, queue chan br
 	default:
 	}
 	p.queuedDataSemaphore.Release(memSize(raw))
-	if buf != nil {
-		bufPool.Put(buf)
-	}
 	return false
 }
 
-func (p *peer) enqueueSendEncodedItem(raw rlp.RawValue, code uint64, queue chan broadcastItem, buf *bytes.Buffer) {
+func (p *peer) enqueueSendEncodedItem(raw rlp.RawValue, code uint64, queue chan broadcastItem) {
 	if !p.queuedDataSemaphore.Acquire(memSize(raw), 10*time.Second) {
-		if buf != nil {
-			bufPool.Put(buf)
-		}
 		return
 	}
 	item := broadcastItem{
-		Code: code,
-		Raw:  raw,
-		buf:  buf,
+		Code:       code,
+		Raw:        raw,
+		ReceivedAt: time.Now(),
+		EnqueuedAt: time.Now(),
 	}
 	select {
 	case queue <- item:
@@ -274,9 +236,6 @@ func (p *peer) enqueueSendEncodedItem(raw rlp.RawValue, code uint64, queue chan 
 	case <-p.term:
 	}
 	p.queuedDataSemaphore.Release(memSize(raw))
-	if buf != nil {
-		bufPool.Put(buf)
-	}
 }
 
 func SplitTransactions(txs types.Transactions, fn func(types.Transactions)) {
@@ -318,51 +277,45 @@ func SplitEvents(events dag.Events, fn func(dag.Events)) {
 // AsyncSendTransactions queues list of transactions propagation to a remote
 // peer. If the peer's broadcast queue is full, the transactions are silently dropped.
 func (p *peer) AsyncSendTransactions(txs types.Transactions, queue chan broadcastItem) {
-	buf := bufPool.Get().(*bytes.Buffer)
-	buf.Reset()
-
-	// Pre-allocate buffer to avoid resizes
-	size := 0
-	for _, tx := range txs {
-		size += int(tx.Size()) + 100 // RLP overhead estimate
-	}
-	buf.Grow(size)
-
-	if err := rlp.Encode(buf, txs); err != nil {
-		bufPool.Put(buf)
+	raw, err := rlp.EncodeToBytes(txs)
+	if err != nil {
 		return
 	}
 
-	if p.asyncSendEncodedItem(rlp.RawValue(buf.Bytes()), EvmTxsMsg, queue, buf) {
-		sentTxsPromotedCounter.Inc(int64(len(txs)))
+	item := broadcastItem{Code: EvmTxsMsg, Raw: rlp.RawValue(raw), EnqueuedAt: time.Now(), ReceivedAt: time.Now()}
+	if p.sendItem(item, queue) {
 		// Mark all the transactions as known, but ensure we don't overflow our limits
 		for _, tx := range txs {
 			p.knownTxs.Add(tx.Hash())
 		}
 	} else {
-		droppedTxsPromotedCounter.Inc(int64(len(txs)))
 		p.Log().Debug("Dropping transactions propagation", "count", len(txs))
+	}
+}
+
+// Helper to handle the common sending logic with timing
+func (p *peer) sendItem(item broadcastItem, queue chan broadcastItem) bool {
+	if !p.queuedDataSemaphore.TryAcquire(memSize(item.Raw)) {
+		return false
+	}
+	select {
+	case queue <- item:
+		return true
+	default:
+		p.queuedDataSemaphore.Release(memSize(item.Raw))
+		return false
 	}
 }
 
 // AsyncSendTransactionHashes queues list of transactions propagation to a remote
 // peer. If the peer's broadcast queue is full, the transactions are silently dropped.
 func (p *peer) AsyncSendTransactionHashes(txids []common.Hash, queue chan broadcastItem) {
-	buf := bufPool.Get().(*bytes.Buffer)
-	buf.Reset()
-
-	// Pre-allocate buffer to avoid resizes
-	// Each hash is 32 bytes + 1 byte RLP prefix.
-	size := len(txids)*33 + 100
-	buf.Grow(size)
-
-	if err := rlp.Encode(buf, txids); err != nil {
-		bufPool.Put(buf)
+	raw, err := rlp.EncodeToBytes(txids)
+	if err != nil {
 		return
 	}
 
-	if p.asyncSendEncodedItem(rlp.RawValue(buf.Bytes()), NewEvmTxHashesMsg, queue, buf) {
-		sentTxHashesCounter.Inc(int64(len(txids)))
+	if p.asyncSendEncodedItem(rlp.RawValue(raw), NewEvmTxHashesMsg, queue) {
 		// Mark all the transactions as known, but ensure we don't overflow our limits
 		for _, tx := range txids {
 			p.knownTxs.Add(tx)
@@ -376,20 +329,11 @@ func (p *peer) AsyncSendTransactionHashes(txids []common.Hash, queue chan broadc
 // peer.
 // The method is blocking in a case if the peer's broadcast queue is full.
 func (p *peer) EnqueueSendTransactions(txs types.Transactions, queue chan broadcastItem) {
-	buf := bufPool.Get().(*bytes.Buffer)
-	buf.Reset()
-
-	size := 0
-	for _, tx := range txs {
-		size += int(tx.Size()) + 100
-	}
-	buf.Grow(size)
-	if err := rlp.Encode(buf, txs); err != nil {
-		bufPool.Put(buf)
+	raw, err := rlp.EncodeToBytes(txs)
+	if err != nil {
 		return
 	}
-	p.enqueueSendEncodedItem(rlp.RawValue(buf.Bytes()), EvmTxsMsg, queue, buf)
-	sentTxsRequestedCounter.Inc(int64(len(txs)))
+	p.enqueueSendEncodedItem(rlp.RawValue(raw), EvmTxsMsg, queue)
 	// Mark all the transactions as known, but ensure we don't overflow our limits
 	for _, tx := range txs {
 		p.knownTxs.Add(tx.Hash())
@@ -404,39 +348,23 @@ func (p *peer) SendEventIDs(hashes []hash.Event) error {
 		p.knownEvents.Add(hash)
 	}
 
-	buf := bufPool.Get().(*bytes.Buffer)
-	defer bufPool.Put(buf)
-	buf.Reset()
-
-	// Pre-allocate buffer to avoid resizes
-	// Each hash is 32 bytes + 1 byte RLP prefix.
-	size := len(hashes)*33 + 100
-	buf.Grow(size)
-
-	if err := rlp.Encode(buf, hashes); err != nil {
+	raw, err := rlp.EncodeToBytes(hashes)
+	if err != nil {
 		return err
 	}
-	return p2p.Send(p.rw, NewEventIDsMsg, rlp.RawValue(buf.Bytes()))
+	return p2p.Send(p.rw, NewEventIDsMsg, rlp.RawValue(raw))
 }
 
 // AsyncSendEventIDs queues the availability of a event for propagation to a
 // remote peer. If the peer's broadcast queue is full, the event is silently
 // dropped.
 func (p *peer) AsyncSendEventIDs(ids hash.Events, queue chan broadcastItem) {
-	buf := bufPool.Get().(*bytes.Buffer)
-	buf.Reset()
-
-	// Pre-allocate buffer to avoid resizes
-	// Each hash is 32 bytes + 1 byte RLP prefix.
-	size := len(ids)*33 + 100
-	buf.Grow(size)
-
-	if err := rlp.Encode(buf, ids); err != nil {
-		bufPool.Put(buf)
+	raw, err := rlp.EncodeToBytes(ids)
+	if err != nil {
 		return
 	}
 
-	if p.asyncSendEncodedItem(rlp.RawValue(buf.Bytes()), NewEventIDsMsg, queue, buf) {
+	if p.asyncSendEncodedItem(rlp.RawValue(raw), NewEventIDsMsg, queue) {
 		// Mark all the event hash as known, but ensure we don't overflow our limits
 		for _, id := range ids {
 			p.knownEvents.Add(id)
@@ -453,21 +381,11 @@ func (p *peer) SendEvents(events inter.EventPayloads) error {
 		p.knownEvents.Add(event.ID())
 	}
 
-	buf := bufPool.Get().(*bytes.Buffer)
-	defer bufPool.Put(buf)
-	buf.Reset()
-
-	// Pre-allocate buffer to avoid resizes
-	size := 0
-	for _, e := range events {
-		size += e.Size() + 100 // RLP overhead estimate
-	}
-	buf.Grow(size)
-
-	if err := rlp.Encode(buf, events); err != nil {
+	raw, err := rlp.EncodeToBytes(events)
+	if err != nil {
 		return err
 	}
-	return p2p.Send(p.rw, EventsMsg, rlp.RawValue(buf.Bytes()))
+	return p2p.Send(p.rw, EventsMsg, rlp.RawValue(raw))
 }
 
 // SendEventsRLP propagates a batch of RLP events to a remote peer.
@@ -477,41 +395,22 @@ func (p *peer) SendEventsRLP(events []rlp.RawValue, ids []hash.Event) error {
 		p.knownEvents.Add(id)
 	}
 
-	buf := bufPool.Get().(*bytes.Buffer)
-	defer bufPool.Put(buf)
-	buf.Reset()
-
-	size := 0
-	for _, e := range events {
-		size += len(e)
-	}
-	buf.Grow(size + 100)
-
-	if err := rlp.Encode(buf, events); err != nil {
+	raw, err := rlp.EncodeToBytes(events)
+	if err != nil {
 		return err
 	}
-	return p2p.Send(p.rw, EventsMsg, rlp.RawValue(buf.Bytes()))
+	return p2p.Send(p.rw, EventsMsg, rlp.RawValue(raw))
 }
 
 // AsyncSendEvents queues an entire event for propagation to a remote peer.
 // If the peer's broadcast queue is full, the events are silently dropped.
 func (p *peer) AsyncSendEvents(events inter.EventPayloads, queue chan broadcastItem) bool {
-	buf := bufPool.Get().(*bytes.Buffer)
-	buf.Reset()
-
-	// Pre-allocate buffer to avoid resizes
-	size := 0
-	for _, e := range events {
-		size += e.Size() + 100 // RLP overhead estimate
-	}
-	buf.Grow(size)
-
-	if err := rlp.Encode(buf, events); err != nil {
-		bufPool.Put(buf)
+	raw, err := rlp.EncodeToBytes(events)
+	if err != nil {
 		return false
 	}
 
-	if p.asyncSendEncodedItem(rlp.RawValue(buf.Bytes()), EventsMsg, queue, buf) {
+	if p.asyncSendEncodedItem(rlp.RawValue(raw), EventsMsg, queue) {
 		// Mark all the event hash as known, but ensure we don't overflow our limits
 		for _, event := range events {
 			p.knownEvents.Add(event.ID())
@@ -525,19 +424,11 @@ func (p *peer) AsyncSendEvents(events inter.EventPayloads, queue chan broadcastI
 // EnqueueSendEventsRLP queues an entire RLP event for propagation to a remote peer.
 // The method is blocking in a case if the peer's broadcast queue is full.
 func (p *peer) EnqueueSendEventsRLP(events []rlp.RawValue, ids []hash.Event, queue chan broadcastItem) {
-	buf := bufPool.Get().(*bytes.Buffer)
-	buf.Reset()
-
-	size := 0
-	for _, e := range events {
-		size += len(e)
-	}
-	buf.Grow(size + 100)
-	if err := rlp.Encode(buf, events); err != nil {
-		bufPool.Put(buf)
+	raw, err := rlp.EncodeToBytes(events)
+	if err != nil {
 		return
 	}
-	p.enqueueSendEncodedItem(rlp.RawValue(buf.Bytes()), EventsMsg, queue, buf)
+	p.enqueueSendEncodedItem(rlp.RawValue(raw), EventsMsg, queue)
 	// Mark all the event hash as known, but ensure we don't overflow our limits
 	for _, id := range ids {
 		p.knownEvents.Add(id)
@@ -547,22 +438,16 @@ func (p *peer) EnqueueSendEventsRLP(events []rlp.RawValue, ids []hash.Event, que
 // AsyncSendProgress queues a progress propagation to a remote peer.
 // If the peer's broadcast queue is full, the progress is silently dropped.
 func (p *peer) AsyncSendProgress(progress PeerProgress, queue chan broadcastItem) {
-	buf := bufPool.Get().(*bytes.Buffer)
-	buf.Reset()
-	buf.Grow(256)
-	if err := rlp.Encode(buf, progress); err != nil {
-		bufPool.Put(buf)
+	raw, err := rlp.EncodeToBytes(progress)
+	if err != nil {
 		return
 	}
-	if !p.asyncSendEncodedItem(rlp.RawValue(buf.Bytes()), ProgressMsg, queue, buf) {
+	if !p.asyncSendEncodedItem(rlp.RawValue(raw), ProgressMsg, queue) {
 		p.Log().Debug("Dropping peer progress propagation")
 	}
 }
 
 func (p *peer) RequestEvents(ids hash.Events) error {
-	buf := bufPool.Get().(*bytes.Buffer)
-	defer bufPool.Put(buf)
-
 	// divide big batch into smaller ones
 	for start := 0; start < len(ids); start += softLimitItems {
 		end := len(ids)
@@ -572,16 +457,11 @@ func (p *peer) RequestEvents(ids hash.Events) error {
 		batch := ids[start:end]
 		p.Log().Debug("Fetching batch of events", "count", len(batch))
 
-		buf.Reset()
-		// Pre-allocate buffer to avoid resizes
-		// Each hash is 32 bytes + 1 byte RLP prefix.
-		size := len(batch)*33 + 100
-		buf.Grow(size)
-
-		if err := rlp.Encode(buf, batch); err != nil {
+		raw, err := rlp.EncodeToBytes(batch)
+		if err != nil {
 			return err
 		}
-		if err := p2p.Send(p.rw, GetEventsMsg, rlp.RawValue(buf.Bytes())); err != nil {
+		if err := p2p.Send(p.rw, GetEventsMsg, rlp.RawValue(raw)); err != nil {
 			return err
 		}
 	}
@@ -589,9 +469,6 @@ func (p *peer) RequestEvents(ids hash.Events) error {
 }
 
 func (p *peer) RequestTransactions(txids []common.Hash) error {
-	buf := bufPool.Get().(*bytes.Buffer)
-	defer bufPool.Put(buf)
-
 	// divide big batch into smaller ones
 	for start := 0; start < len(txids); start += softLimitItems {
 		end := len(txids)
@@ -601,16 +478,11 @@ func (p *peer) RequestTransactions(txids []common.Hash) error {
 		batch := txids[start:end]
 		p.Log().Debug("Fetching batch of transactions", "count", len(batch))
 
-		buf.Reset()
-		// Pre-allocate buffer to avoid resizes
-		// Each hash is 32 bytes + 1 byte RLP prefix.
-		size := len(batch)*33 + 100
-		buf.Grow(size)
-
-		if err := rlp.Encode(buf, batch); err != nil {
+		raw, err := rlp.EncodeToBytes(batch)
+		if err != nil {
 			return err
 		}
-		if err := p2p.Send(p.rw, GetEvmTxsMsg, rlp.RawValue(buf.Bytes())); err != nil {
+		if err := p2p.Send(p.rw, GetEvmTxsMsg, rlp.RawValue(raw)); err != nil {
 			return err
 		}
 	}
@@ -623,27 +495,19 @@ func (p *peer) SendEventsStream(r dagstream.Response, ids hash.Events) error {
 		p.knownEvents.Add(id)
 	}
 
-	buf := bufPool.Get().(*bytes.Buffer)
-	defer bufPool.Put(buf)
-	buf.Reset()
-	buf.Grow(4096) // Heuristic for stream response size
-
-	if err := rlp.Encode(buf, r); err != nil {
+	raw, err := rlp.EncodeToBytes(r)
+	if err != nil {
 		return err
 	}
-	return p2p.Send(p.rw, EventsStreamResponse, rlp.RawValue(buf.Bytes()))
+	return p2p.Send(p.rw, EventsStreamResponse, rlp.RawValue(raw))
 }
 
 func (p *peer) RequestEventsStream(r dagstream.Request) error {
-	buf := bufPool.Get().(*bytes.Buffer)
-	defer bufPool.Put(buf)
-	buf.Reset()
-	buf.Grow(512) // Heuristic for request size
-
-	if err := rlp.Encode(buf, r); err != nil {
+	raw, err := rlp.EncodeToBytes(r)
+	if err != nil {
 		return err
 	}
-	return p2p.Send(p.rw, RequestEventsStream, rlp.RawValue(buf.Bytes()))
+	return p2p.Send(p.rw, RequestEventsStream, rlp.RawValue(raw))
 }
 
 // Handshake executes the protocol handshake, negotiating version number,
@@ -655,20 +519,16 @@ func (p *peer) Handshake(network uint64, progress PeerProgress, genesis common.H
 
 	go func() {
 		// send both HandshakeMsg and ProgressMsg
-		buf := bufPool.Get().(*bytes.Buffer)
-		defer bufPool.Put(buf)
-		buf.Reset()
-		buf.Grow(512)
-
-		if err := rlp.Encode(buf, &handshakeData{
+		raw, err := rlp.EncodeToBytes(&handshakeData{
 			ProtocolVersion: uint32(p.version),
 			NetworkID:       network,
 			Genesis:         genesis,
-		}); err != nil {
+		})
+		if err != nil {
 			errc <- err
 			return
 		}
-		err := p2p.Send(p.rw, HandshakeMsg, rlp.RawValue(buf.Bytes()))
+		err = p2p.Send(p.rw, HandshakeMsg, rlp.RawValue(raw))
 		if err != nil {
 			errc <- err
 		}
@@ -694,15 +554,11 @@ func (p *peer) Handshake(network uint64, progress PeerProgress, genesis common.H
 }
 
 func (p *peer) SendProgress(progress PeerProgress) error {
-	buf := bufPool.Get().(*bytes.Buffer)
-	defer bufPool.Put(buf)
-	buf.Reset()
-	buf.Grow(256) // Progress message is small
-
-	if err := rlp.Encode(buf, progress); err != nil {
+	raw, err := rlp.EncodeToBytes(progress)
+	if err != nil {
 		return err
 	}
-	return p2p.Send(p.rw, ProgressMsg, rlp.RawValue(buf.Bytes()))
+	return p2p.Send(p.rw, ProgressMsg, rlp.RawValue(raw))
 }
 
 func (p *peer) readStatus(network uint64, handshake *handshakeData, genesis common.Hash) (err error) {
@@ -717,16 +573,7 @@ func (p *peer) readStatus(network uint64, handshake *handshakeData, genesis comm
 		return errResp(ErrMsgTooLarge, "%v > %v", msg.Size, protocolMaxMsgSize)
 	}
 	// Decode the handshake and make sure everything matches
-	buf := bufPool.Get().(*bytes.Buffer)
-	defer bufPool.Put(buf)
-	buf.Reset()
-	if msg.Size > 0 {
-		buf.Grow(int(msg.Size))
-	}
-	if _, err := buf.ReadFrom(msg.Payload); err != nil {
-		return errResp(ErrDecode, "msg %v: %v", msg, err)
-	}
-	if err := rlp.DecodeBytes(buf.Bytes(), handshake); err != nil {
+	if err := msg.Decode(handshake); err != nil {
 		return errResp(ErrDecode, "msg %v: %v", msg, err)
 	}
 

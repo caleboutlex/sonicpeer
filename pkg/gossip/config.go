@@ -21,8 +21,6 @@ import (
 	"github.com/0xsoniclabs/sonic/gossip/protocols/dag/dagstream/dagstreamseeder"
 )
 
-const nominalSize uint = 1
-
 type (
 	// ProtocolConfig is config for p2p protocol
 	ProtocolConfig struct {
@@ -45,11 +43,13 @@ type (
 		DagStreamLeecher dagstreamleecher.Config
 		DagStreamSeeder  dagstreamseeder.Config
 
-		MaxInitialTxHashesSend   int
-		MaxRandomTxHashesSend    int
-		RandomTxHashesSendPeriod time.Duration
-		PeerInfoCollectionPeriod time.Duration
-		PeerEndPointUpdatePeriod time.Duration
+		MaxInitialTxHashesSend    int
+		MaxRandomTxHashesSend     int
+		RandomTxHashesSendPeriod  time.Duration
+		PeerInfoCollectionPeriod  time.Duration
+		PeerInfoMaintenancePeriod time.Duration
+		PeerEndPointUpdatePeriod  time.Duration
+		PeerStaleEpochGracePeriod time.Duration
 
 		PeerCache PeerCacheConfig
 	}
@@ -186,14 +186,16 @@ func DefaultConfig(scale cachescale.Func) Config {
 				MaxQueuedBatches:    scale.I(32),
 				MaxParallelRequests: 64,
 			},
-			DagStreamLeecher:         dagstreamleecher.DefaultConfig(),
-			DagStreamSeeder:          dagstreamseeder.DefaultConfig(scale),
-			MaxInitialTxHashesSend:   20000,
-			MaxRandomTxHashesSend:    250, // match softLimitItems to fit into one message
-			RandomTxHashesSendPeriod: 1 * time.Second,
-			PeerInfoCollectionPeriod: 1 * time.Second,
-			PeerEndPointUpdatePeriod: 5 * time.Minute,
-			PeerCache:                DefaultPeerCacheConfig(scale),
+			DagStreamLeecher:          dagstreamleecher.DefaultConfig(),
+			DagStreamSeeder:           dagstreamseeder.DefaultConfig(scale),
+			MaxInitialTxHashesSend:    20000,
+			MaxRandomTxHashesSend:     250, // match softLimitItems to fit into one message
+			RandomTxHashesSendPeriod:  1 * time.Second,
+			PeerInfoCollectionPeriod:  5 * time.Second,
+			PeerInfoMaintenancePeriod: 5 * time.Minute,
+			PeerEndPointUpdatePeriod:  5 * time.Minute,
+			PeerStaleEpochGracePeriod: 1 * time.Second,
+			PeerCache:                 DefaultPeerCacheConfig(scale),
 		},
 
 		RPCEVMTimeout: 5 * time.Second,

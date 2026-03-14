@@ -63,7 +63,15 @@ func NewSentry(cfg SentryConfig) (*Sentry, error) {
 	nodeCfg := config.DefaultNodeConfig()
 	nodeCfg.DataDir = cfg.DataDir
 	nodeCfg.P2P.ListenAddr = fmt.Sprintf(":%d", cfg.ListenPort)
-	nodeCfg.P2P.MaxPeers = cfg.MaxPeers
+
+	// If the user specifies a MaxPeers value, use it. Otherwise, keep the default
+	// from DefaultNodeConfig(). A value of 0 would otherwise override the default,
+	// causing the p2p server to use its own internal default value (e.g., 100).
+	if cfg.MaxPeers > 0 {
+		nodeCfg.P2P.MaxPeers = cfg.MaxPeers
+	}
+	log.Info("Configuring P2P peer limit", "maxPeers", nodeCfg.P2P.MaxPeers)
+
 	nodeCfg.P2P.NAT = nil // Explicitly disable NAT, sentry should have a public IP
 
 	// RPC settings

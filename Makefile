@@ -1,6 +1,7 @@
 # Default backend URL. Can be overridden by an environment variable.
 # e.g., BACKEND_URL="ws://your-node-ip:18546" make run
 BACKEND_URL ?= ws://127.0.0.1:18546
+WS_PORT ?= 8546
 
 # Load environment variables from .env file if it exists.
 # This allows you to set your backend URL in a .env file.
@@ -36,7 +37,11 @@ test:
 	--datadir ./build/data \
 	--maxpeers 1000 \
 	--url "$(BACKEND_URL)" \
-	--port 5051
+	--port 3030 \
+	--ws \
+	--ws.addr 0.0.0.0 \
+	--ws.port $(WS_PORT) \
+	--ws.api "eth" \
 
 metrics: 
 	@echo "Running sonicpeer in test mode..."
@@ -44,8 +49,16 @@ metrics:
 	--datadir ./build/data \
 	--maxpeers 1000 \
 	--url "$(BACKEND_URL)" \
-	--port 5051 \
-	--metrics
+	--port 3030 \
+	--metrics \
+	--ws \
+	--ws.addr 0.0.0.0 \
+	--ws.port $(WS_PORT) \
+	--ws.api "eth" \
+
+sidecar: 
+	@echo "Running sidecar script..."
+	go run .sidecar/main.go
 
 # sonicpeer: Builds the sonicpeer executable from source and makes it runnable.
 sonicpeer:
@@ -63,7 +76,7 @@ run: sonicpeer
 	--datadir ./build/data \
 	--maxpeers 1000 \
 	--url "$(BACKEND_URL)" \
-	--port 5051
+	--port 3030
 
 
 # monitoring-up: Starts the Grafana and Prometheus containers in detached mode.

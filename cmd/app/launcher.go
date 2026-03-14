@@ -85,7 +85,7 @@ func initApp() *cli.App {
 	app := cli.NewApp()
 	app.Action = sentryMain
 	app.Name = "sonicpeer"
-	app.Usage = "Sonic MEV Node"
+	app.Usage = "Sonic Sentry Node"
 	app.Version = "1.0.0"
 
 	app.Flags = append(app.Flags, appFlags...)

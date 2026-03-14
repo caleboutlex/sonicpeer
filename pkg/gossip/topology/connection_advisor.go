@@ -159,8 +159,13 @@ func (c *connectionAdvisor[I, T]) GetRedundantPeerSuggestion() *I {
 func (c *connectionAdvisor[I, T]) UpdatePeers(peer I, peers []T) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// Copy the peers slice to take ownership of the data. This allows the caller
+	// to reuse the original slice, which is important for pooling and reducing
+	// allocations in the message handler.
+	peersCopy := make([]T, len(peers))
+	copy(peersCopy, peers)
 	c.neighborhood[peer] = neighborhoodEntry[T]{
-		peers: peers,
+		peers: peersCopy,
 		time:  time.Now(),
 	}
 }

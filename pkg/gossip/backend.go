@@ -23,15 +23,6 @@ type block struct {
 	Atropos common.Hash    `json:"atropos"`
 }
 
-// BackendNodeClient defines the interface for communicating with a trusted, stateful backend node.
-// This would typically be implemented with an RPC client.
-type backend interface {
-	GetChainID() (uint64, error)
-	GetNodeProgress() (PeerProgress, error)
-	SubscribeNewHeads(ctx context.Context, ch chan<- *types.Header) (ethereum.Subscription, error)
-	ProgressUpdaterLoop(stop <-chan struct{})
-}
-
 // rpcBackendClient is an implementation of BackendNodeClient using JSON-RPC.
 type backendClient struct {
 	rpc      *rpc.Client
@@ -78,17 +69,6 @@ func (c *backendClient) GetEpoch() idx.Epoch {
 	return p.Epoch
 }
 
-// GetChainID fetches the chain ID from the backend node using the 'eth_chainId' RPC call.
-func (c *backendClient) fetchChainID() (uint64, error) {
-	var chainID hexutil.Uint64
-	err := c.rpc.Call(&chainID, "eth_chainId")
-	if err != nil {
-		log.Error("Failed to fetch chain ID from backend", "err", err)
-		return 0, err
-	}
-	return uint64(chainID), nil
-}
-
 // GetPeerProgress fetches the current consensus progress from the backend node
 // using the standard 'eth_getBlockByNumber' RPC call.
 func (c *backendClient) fetchNodeProgress() (*PeerProgress, error) {
@@ -102,7 +82,7 @@ func (c *backendClient) fetchNodeProgress() (*PeerProgress, error) {
 		return nil, errors.New("latest block has no number")
 	}
 	if head.Epoch == 0 {
-		return nil, errors.New("Backend returned block with Epoch 0. Ensure backend is a Sonic node.")
+		return nil, errors.New("backend returned block with Epoch 0. Ensure backend is a Sonic node")
 	}
 	return &PeerProgress{
 		Epoch:            idx.Epoch(head.Epoch),

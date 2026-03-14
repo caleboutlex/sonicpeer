@@ -1,21 +1,20 @@
 package gossip
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/Fantom-foundation/lachesis-base/gossip/dagprocessor"
-	"github.com/Fantom-foundation/lachesis-base/gossip/itemsfetcher"
 	"github.com/Fantom-foundation/lachesis-base/hash"
 	"github.com/Fantom-foundation/lachesis-base/inter/dag"
 	"github.com/Fantom-foundation/lachesis-base/inter/idx"
@@ -23,19 +22,13 @@ import (
 	"github.com/Fantom-foundation/lachesis-base/utils/wlru"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
-	notify "github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/p2p/discover/discfilter"
 	"github.com/ethereum/go-ethereum/p2p/enode"
-	"github.com/ethereum/go-ethereum/rlp"
 
 	"sonicpeer/pkg/gossip/topology"
 
-	"github.com/0xsoniclabs/sonic/eventcheck"
-	"github.com/0xsoniclabs/sonic/evmcore"
-	"github.com/0xsoniclabs/sonic/gossip/protocols/dag/dagstream/dagstreamleecher"
-	"github.com/0xsoniclabs/sonic/gossip/protocols/dag/dagstream/dagstreamseeder"
 	"github.com/0xsoniclabs/sonic/inter"
 	"github.com/0xsoniclabs/sonic/logger"
 	"github.com/0xsoniclabs/sonic/utils/caution"
@@ -46,42 +39,8 @@ const (
 	softLimitItems        = 250                // Target maximum number of events or transactions to request/response
 	hardLimitItems        = softLimitItems * 4 // Maximum number of events or transactions to request/response
 
-	// txChanSize is the size of channel listening to NewTxsNotify.
-	// The number is referenced from the size of tx pool.
-	txChanSize = 4096
-
 	TxTurnNonces = 32
 )
-
-var txHashesBufPool = sync.Pool{
-	New: func() interface{} {
-		return make([]common.Hash, 0, 1024)
-	},
-}
-
-var eventIDsBufPool = sync.Pool{
-	New: func() interface{} {
-		return make(hash.Events, 0, 1024)
-	},
-}
-
-var eventBufPool = sync.Pool{
-	New: func() interface{} {
-		return make(inter.EventPayloads, 0, 1024)
-	},
-}
-
-var txBufPool = sync.Pool{
-	New: func() interface{} {
-		return make(types.Transactions, 0, 1024)
-	},
-}
-
-var peerSlicePool = sync.Pool{
-	New: func() interface{} {
-		return make([]*peer, 0, 128)
-	},
-}
 
 func errResp(code errCode, format string, v ...interface{}) error {
 	return fmt.Errorf("%v - %v", code, fmt.Sprintf(format, v...))
@@ -97,16 +56,6 @@ func checkLenLimits(size int, v interface{}) error {
 	return nil
 }
 
-type dagNotifier interface {
-	SubscribeNewEpoch(ch chan<- idx.Epoch) notify.Subscription
-	SubscribeNewEmitted(ch chan<- *inter.EventPayload) notify.Subscription
-}
-
-type processCallback struct {
-	Event         func(*inter.EventPayload) error
-	SwitchEpochTo func(idx.Epoch) error
-}
-
 // handlerConfig holds the configuration for the  Handler.
 type handlerConfig struct {
 	dataDir string
@@ -119,16 +68,16 @@ type handlerConfig struct {
 
 	localId             enode.ID
 	localEndPointSource LocalEndPointSource
-	searcherHook        searcherHook
+	newTxsHook          newTxsHook
 }
 
 type LocalEndPointSource interface {
 	GetLocalEndPoint() *enode.Node
 }
 
-// SearcherHook is a function that gets a "first look" at a transaction.
+// NewTxsHook is a function that gets a "first look" at a transaction.
 // It should be zero-copy and non-blocking.
-type searcherHook func(tx *types.Transaction)
+type newTxsHook func(tx *types.Transaction)
 
 // handler is a lightweight P2P Handler that gossips transactions
 // and events without maintaining local state or participating in consensus.
@@ -139,37 +88,13 @@ type handler struct {
 	config    Config
 	dataDir   string
 
-	txpool   TxPool
 	maxPeers int
 
 	peers *peerSet
 
-	txsCh  chan evmcore.NewTxsNotify
-	txsSub notify.Subscription
-
-	dagLeecher   *dagstreamleecher.Leecher
-	dagSeeder    *dagstreamseeder.Seeder
-	dagProcessor *dagprocessor.Processor
-	dagFetcher   *itemsfetcher.Fetcher
-
-	process processCallback
-
-	txFetcher *itemsfetcher.Fetcher
-
-	checkers *eventcheck.Checkers
-
 	msgSemaphore *datasemaphore.DataSemaphore
 
 	//store    *Store 	// TODO: MAKE A STORE TSTRUCT TO HOLD ALL INFO FROM BACKEND AND SENTRY NODE
-
-	engineMu sync.Locker
-
-	notifier             dagNotifier
-	emittedEventsCh      chan *inter.EventPayload
-	emittedEventsSub     notify.Subscription
-	newEpochsCh          chan idx.Epoch
-	newEpochsSub         notify.Subscription
-	quitProgressBradcast chan struct{}
 
 	// channels for syncer, txsyncLoop
 	quitSync chan struct{}
@@ -181,14 +106,19 @@ type handler struct {
 	peerWG  sync.WaitGroup
 	started sync.WaitGroup
 
-	peerInfoStop        chan<- struct{}
-	backendProgressStop chan<- struct{}
-	statsStop           chan<- struct{}
+	peerInfoStop            chan<- struct{}
+	peerInfoMaintenanceStop chan<- struct{}
+	backendProgressStop     chan<- struct{}
+	statsStop               chan<- struct{}
 	// suggests new peers to connect to by monitoring the neighborhood
 	connectionAdvisor topology.ConnectionAdvisor
 	nextSuggestedPeer chan *enode.Node
 
+	discoveredNodes   map[enode.ID]*enode.Node
+	discoveredNodesMu sync.RWMutex
+
 	localEndPointSource LocalEndPointSource
+	newTxsHook          newTxsHook
 
 	logger.Instance
 
@@ -234,7 +164,10 @@ func newHandler(c handlerConfig) (*handler, error) {
 		connectionAdvisor: topology.NewConnectionAdvisor(c.localId),
 		nextSuggestedPeer: make(chan *enode.Node, 1024),
 
+		discoveredNodes: make(map[enode.ID]*enode.Node),
+
 		localEndPointSource: c.localEndPointSource,
+		newTxsHook:          c.newTxsHook,
 
 		Instance: logger.New("PM"),
 
@@ -251,15 +184,6 @@ func newHandler(c handlerConfig) (*handler, error) {
 
 	h.started.Add(1)
 	return h, nil
-}
-
-func (h *handler) peerMisbehaviour(peer string, err error) bool {
-	if eventcheck.IsBan(err) {
-		log.Warn("Dropping peer due to a misbehaviour", "peer", peer, "err", err)
-		h.removePeer(peer)
-		return true
-	}
-	return false
 }
 
 func (h *handler) removePeer(id string) {
@@ -294,11 +218,23 @@ func (h *handler) Start(maxPeers int) {
 	h.peerInfoStop = peerInfoStopChannel
 	go h.peerInfoCollectionLoop(peerInfoStopChannel)
 
+	// Start the peer info maintenance loop (subset polling)
+	h.loopsWg.Add(1)
+	peerInfoMaintenanceStopChannel := make(chan struct{})
+	h.peerInfoMaintenanceStop = peerInfoMaintenanceStopChannel
+	go h.peerInfoMaintenanceLoop(peerInfoMaintenanceStopChannel)
+
 	// Start the backend client loop
 	h.loopsWg.Add(1)
 	backendProgressStopChanel := make(chan struct{})
 	h.backendProgressStop = backendProgressStopChanel
 	go h.backend.NodeProgressLoop(backendProgressStopChanel, &h.loopsWg)
+
+	// Start the stats loop
+	h.loopsWg.Add(1)
+	statsStopChannel := make(chan struct{})
+	h.statsStop = statsStopChannel
+	go h.statsLoop(statsStopChannel)
 
 	// Load persisted peers
 	h.loadPeers()
@@ -317,6 +253,9 @@ func (h *handler) Stop() {
 
 	close(h.peerInfoStop)
 	h.peerInfoStop = nil
+
+	close(h.peerInfoMaintenanceStop)
+	h.peerInfoMaintenanceStop = nil
 
 	close(h.backendProgressStop)
 	h.backendProgressStop = nil
@@ -373,8 +312,9 @@ func (h *handler) handle(p *peer) (err error) {
 	p.Log().Trace("Connecting peer", "peer", p.ID(), "name", p.Name())
 
 	useless := isUseless(p.Node(), p.Name())
-	if !p.Peer.Info().Network.Trusted && useless && h.peers.UselessNum() >= h.maxPeers/10 {
-		// don't allow more than 10% of useless peers
+	// For a Sentry node, we can be more permissive. We'll allow up to 50%
+	// of our slots to be "useless" peers, as they still contribute to tx discovery.
+	if !p.Peer.Info().Network.Trusted && useless && h.peers.UselessNum() >= h.maxPeers/2 {
 		p.Log().Trace("Rejecting peer as useless", "peer", p.ID(), "name", p.Name())
 		return p2p.DiscUselessPeer
 	}
@@ -417,6 +357,10 @@ func (h *handler) handle(p *peer) (err error) {
 		p.Log().Debug("Failed to send end-point update request", "err", err)
 	}
 
+	if err := p.SendPeerInfoRequest(); err != nil {
+		p.Log().Debug("Failed to send initial peer info request", "err", err)
+	}
+
 	// Handle incoming messages until the connection is torn down
 	for {
 		if err := h.handleMsg(p); err != nil {
@@ -430,38 +374,6 @@ func (h *handler) handle(p *peer) (err error) {
 	}
 }
 
-func interfacesToEventIDs(ids []interface{}) hash.Events {
-	res := make(hash.Events, len(ids))
-	for i, id := range ids {
-		res[i] = id.(hash.Event)
-	}
-	return res
-}
-
-func eventIDsToInterfaces(ids hash.Events) []interface{} {
-	res := make([]interface{}, len(ids))
-	for i, id := range ids {
-		res[i] = id
-	}
-	return res
-}
-
-func interfacesToTxids(ids []interface{}) []common.Hash {
-	res := make([]common.Hash, len(ids))
-	for i, id := range ids {
-		res[i] = id.(common.Hash)
-	}
-	return res
-}
-
-func txidsToInterfaces(ids []common.Hash) []interface{} {
-	res := make([]interface{}, len(ids))
-	for i, id := range ids {
-		res[i] = id
-	}
-	return res
-}
-
 func (h *handler) handleTxHashes(p *peer, announces []common.Hash, receivedAt time.Time) {
 	// Only request what we don't know
 	toRequest := make([]common.Hash, 0, len(announces))
@@ -470,6 +382,7 @@ func (h *handler) handleTxHashes(p *peer, announces []common.Hash, receivedAt ti
 	for _, id := range announces {
 		// Mark transaction as seen for peer
 		p.MarkTransaction(id)
+		// Metric: Increment total_tx_announcements_received_total
 
 		// Add it to the cache if its not found in the txHashCache and the txCache
 		if !h.txHashCache.Contains(id) {
@@ -481,19 +394,19 @@ func (h *handler) handleTxHashes(p *peer, announces []common.Hash, receivedAt ti
 	if err := p.RequestTransactions(toRequest); err != nil {
 		p.Log().Warn("Failed to request transactions", "err", err)
 	}
-	return
 }
 
 func (h *handler) handleTxs(p *peer, txs types.Transactions, receivedAt time.Time) {
 	// Mark the hashes as present at the remote node
 	for _, tx := range txs {
-
 		id := tx.Hash()
-
 		p.MarkTransaction(id)
 
 		if !h.txHashCache.Contains(id) {
 			h.txHashCache.Add(id, struct{}{}, 1)
+			if h.newTxsHook != nil {
+				h.newTxsHook(tx)
+			}
 		}
 	}
 }
@@ -510,7 +423,6 @@ func (h *handler) handleEventHashes(p *peer, announces hash.Events, receivedAt t
 			toRequest = append(toRequest, id)
 		}
 	}
-	p.RequestEvents(toRequest)
 	if err := p.RequestEvents(toRequest); err != nil {
 		p.Log().Warn("Failed to request events", "err", err)
 	}
@@ -538,6 +450,8 @@ func (h *handler) handleEvents(p *peer, events dag.Events, ordered bool, receive
 
 // handleMsg is the core message routing logic for the  sentry.
 func (h *handler) handleMsg(p *peer) error {
+	receivedAt := time.Now()
+
 	// Read the next message from the remote peer, and ensure it's fully consumed
 	msg, err := p.rw.ReadMsg()
 	if err != nil {
@@ -547,19 +461,6 @@ func (h *handler) handleMsg(p *peer) error {
 		return errResp(ErrMsgTooLarge, "%v > %v", msg.Size, protocolMaxMsgSize)
 	}
 	defer caution.ExecuteAndReportError(&err, msg.Discard, "failed to discard message")
-
-	// Read payload into buffer to avoid holding semaphore during network I/O (Slowloris protection)
-	// We use a pooled buffer to minimize allocations.
-	buf := bufPool.Get().(*bytes.Buffer)
-	defer bufPool.Put(buf)
-	buf.Reset()
-	if msg.Size > 0 {
-		buf.Grow(int(msg.Size))
-	}
-	if _, err := buf.ReadFrom(msg.Payload); err != nil {
-		return err
-	}
-	blob := buf.Bytes()
 
 	// Acquire semaphore for serialized messages
 	eventsSizeEst := dag.Metric{
@@ -580,80 +481,45 @@ func (h *handler) handleMsg(p *peer) error {
 
 	case ProgressMsg:
 		var progress PeerProgress
-		if err := rlp.DecodeBytes(blob, &progress); err != nil {
+		if err := msg.Decode(&progress); err != nil {
 			return errResp(ErrDecode, "%v: %v", msg, err)
-		}
-
-		if progress.Epoch < h.backend.GetEpoch() {
-			p.Log().Warn("Dropping unsynced peer", "name", p.Name(), "ip", p.RemoteAddr(), "peer_epoch", progress.Epoch, "my_epoch", h.backend.GetEpoch())
-			h.removePeer(p.id)
-			return p2p.DiscUselessPeer
 		}
 		p.SetProgress(progress)
 
 	case EvmTxsMsg:
-		// Record timestamp before decoding
-		recivedAt := time.Now()
-
-		txs := txBufPool.Get().(types.Transactions)
-		txs = txs[:0]
-		defer txBufPool.Put(txs)
-		if err := rlp.DecodeBytes(blob, &txs); err != nil {
+		// Transactions can be processed, parse all of them and deliver to the pool
+		var txs types.Transactions
+		if err := msg.Decode(&txs); err != nil {
 			return errResp(ErrDecode, "msg %v: %v", msg, err)
 		}
 		if err := checkLenLimits(len(txs), txs); err != nil {
 			return err
 		}
-		h.handleTxs(p, txs, recivedAt)
+		txids := make([]interface{}, txs.Len())
+		for i, tx := range txs {
+			txids[i] = tx.Hash()
+		}
+		h.handleTxs(p, txs, receivedAt)
 
 	case NewEvmTxHashesMsg:
-		// Record timestamp before decoding
-		recivedAt := time.Now()
-
-		txHashes := txHashesBufPool.Get().([]common.Hash)
-		txHashes = txHashes[:0]
-		defer txHashesBufPool.Put(txHashes)
-		if err := rlp.DecodeBytes(blob, &txHashes); err != nil {
+		// Transactions can be processed, parse all of them and deliver to the pool
+		var txHashes []common.Hash
+		if err := msg.Decode(&txHashes); err != nil {
 			return errResp(ErrDecode, "msg %v: %v", msg, err)
 		}
 		if err := checkLenLimits(len(txHashes), txHashes); err != nil {
 			return err
 		}
-		h.handleTxHashes(p, txHashes, recivedAt)
+		h.handleTxHashes(p, txHashes, receivedAt)
 
 	case GetEvmTxsMsg:
 		// Sonicpeer: We dont want to waste bandwith so we skip this and just return nil
-		return nil
 
 	case EventsMsg:
-		// Record timestamp before decoding
-		recivedAt := time.Now()
-
-		events := eventBufPool.Get().(inter.EventPayloads)
-		events = events[:0]
-		defer eventBufPool.Put(events)
-		if err := rlp.DecodeBytes(blob, &events); err != nil {
-			return errResp(ErrDecode, "%v: %v", msg, err)
-		}
-		if err := checkLenLimits(len(events), events); err != nil {
-			return err
-		}
-		h.handleEvents(p, events.Bases(), (events.Len() > 1), recivedAt)
+		// Sonicpeer: We dont want to waste bandwith so we skip this and just return nil
 
 	case NewEventIDsMsg:
-		// Record timestamp before decoding
-		recivedAt := time.Now()
-
-		announces := eventIDsBufPool.Get().(hash.Events)
-		announces = announces[:0]
-		defer eventIDsBufPool.Put(announces)
-		if err := rlp.DecodeBytes(blob, &announces); err != nil {
-			return errResp(ErrDecode, "%v: %v", msg, err)
-		}
-		if err := checkLenLimits(len(announces), announces); err != nil {
-			return err
-		}
-		h.handleEventHashes(p, announces, recivedAt)
+		// Sonicpeer: We dont want to waste bandwith so we skip this and just return nil
 
 	case GetEventsMsg:
 		// Sonicpeer: We dont want to waste bandwith so we skip this and just return nil
@@ -665,47 +531,33 @@ func (h *handler) handleMsg(p *peer) error {
 		// Sonicpeer: We dont want to waste bandwith so we skip this and just return nil
 
 	case GetPeerInfosMsg:
-		infos := []peerInfo{}
-		peers := peerSlicePool.Get().([]*peer)
-		peers = h.peers.ListTo(peers[:0])
-		defer peerSlicePool.Put(peers)
-		for _, peer := range peers {
-			if peer.Useless() {
-				continue
-			}
-			info := peer.endPoint.Load()
-			if info == nil {
-				continue
-			}
-			infos = append(infos, peerInfo{
-				Enode: info.enode.String(),
-			})
-		}
-		buf := bufPool.Get().(*bytes.Buffer)
-		defer bufPool.Put(buf)
-		buf.Reset()
-		if err := rlp.Encode(buf, peerInfoMsg{Peers: infos}); err != nil {
-			return errResp(ErrDecode, "failed to encode peer infos: %v", err)
-		}
-		err := p2p.Send(p.rw, PeerInfosMsg, rlp.RawValue(buf.Bytes()))
-		if err != nil {
-			return err
-		}
+		// Sonicpeer: We prioritize bandwidth and CPU for transaction discovery.
+		// We choose not to respond to peerlist requests to remain as fast as possible.
+		return nil
 
 	case PeerInfosMsg:
 		var infos peerInfoMsg
-		if err := rlp.DecodeBytes(blob, &infos); err != nil {
+		if err := msg.Decode(&infos); err != nil {
 			return errResp(ErrDecode, "%v: %v", msg, err)
 		}
+
+		//h.Log.Info("Received peer infos", "count", len(infos.Peers), "peer", p.id)
+
 		reportedPeers := []*enode.Node{}
 		for _, info := range infos.Peers {
 			var enode enode.Node
 			if err := enode.UnmarshalText([]byte(info.Enode)); err != nil {
-				h.Log.Debug("Failed to unmarshal enode", "enode", info.Enode, "err", err)
+				h.Log.Warn("Failed to unmarshal enode", "enode", info.Enode, "err", err)
 			} else {
 				reportedPeers = append(reportedPeers, &enode)
 			}
 		}
+
+		h.discoveredNodesMu.Lock()
+		for _, n := range reportedPeers {
+			h.discoveredNodes[n.ID()] = n
+		}
+		h.discoveredNodesMu.Unlock()
 		h.connectionAdvisor.UpdatePeers(p.ID(), reportedPeers)
 
 	case GetEndPointMsg:
@@ -717,31 +569,25 @@ func (h *handler) handleMsg(p *peer) error {
 		if enode == nil {
 			return nil
 		}
-		buf := bufPool.Get().(*bytes.Buffer)
-		defer bufPool.Put(buf)
-		buf.Reset()
-		if err := rlp.Encode(buf, enode.String()); err != nil {
-			return err
-		}
-		if err := p2p.Send(p.rw, EndPointUpdateMsg, rlp.RawValue(buf.Bytes())); err != nil {
+		if err := p2p.Send(p.rw, EndPointUpdateMsg, enode.String()); err != nil {
 			return err
 		}
 
 	case EndPointUpdateMsg:
 		var encoded string
-		if err := rlp.DecodeBytes(blob, &encoded); err != nil {
+		if err := msg.Decode(&encoded); err != nil {
 			return errResp(ErrDecode, "%v: %v", msg, err)
 		}
-
 		var enode enode.Node
 		if err := enode.UnmarshalText([]byte(encoded)); err != nil {
-			h.Log.Debug("Failed to unmarshal enode", "enode", encoded, "err", err)
+			h.Log.Warn("Failed to unmarshal enode", "enode", encoded, "err", err)
 		} else {
 			p.endPoint.Store(&peerEndPointInfo{
 				enode:     enode,
 				timestamp: time.Now(),
 			})
 		}
+
 	default:
 		return errResp(ErrInvalidMsgCode, "%v", msg.Code)
 	}
@@ -749,94 +595,107 @@ func (h *handler) handleMsg(p *peer) error {
 }
 
 func (h *handler) decideBroadcastAggressiveness(size int, passed time.Duration, peersNum int) int {
-	// MEV: Always broadcast to everyone immediately to ensure maximum propagation speed.
-	return peersNum
+	percents := 100
+	maxPercents := 1000000 * percents
+	latencyVsThroughputTradeoff := maxPercents
+	cfg := h.config.Protocol
+	if cfg.ThroughputImportance != 0 {
+		latencyVsThroughputTradeoff = (cfg.LatencyImportance * percents) / cfg.ThroughputImportance
+	}
+
+	broadcastCost := passed * time.Duration(128+size) / 128
+	broadcastAllCostTarget := time.Duration(latencyVsThroughputTradeoff) * (700 * time.Millisecond) / time.Duration(percents)
+	broadcastSqrtCostTarget := broadcastAllCostTarget * 10
+
+	fullRecipients := 0
+	if latencyVsThroughputTradeoff >= maxPercents {
+		// edge case
+		fullRecipients = peersNum
+	} else if latencyVsThroughputTradeoff <= 0 {
+		// edge case
+		fullRecipients = 0
+	} else if broadcastCost <= broadcastAllCostTarget {
+		// if event is small or was created recently, always send to everyone full event
+		fullRecipients = peersNum
+	} else if broadcastCost <= broadcastSqrtCostTarget || passed == 0 {
+		// if event is big but was created recently, send full event to subset of peers
+		fullRecipients = int(math.Sqrt(float64(peersNum)))
+		if fullRecipients < 4 {
+			fullRecipients = 4
+		}
+	}
+	if fullRecipients > peersNum {
+		fullRecipients = peersNum
+	}
+	return fullRecipients
+}
+
+// BroadcastEvent will either propagate a event to a subset of it's peers, or
+// will only announce it's availability (depending what's requested).
+func (h *handler) BroadcastEvent(event *inter.EventPayload, passed time.Duration) int {
+	if passed < 0 {
+		passed = 0
+	}
+	id := event.ID()
+	peers := h.peers.PeersWithoutEvent(id)
+	if len(peers) == 0 {
+		log.Trace("Event is already known to all peers", "hash", id)
+		return 0
+	}
+
+	fullRecipients := h.decideBroadcastAggressiveness(event.Size(), passed, len(peers))
+
+	// Exclude low quality peers from fullBroadcast
+	var fullBroadcast = make([]*peer, 0, fullRecipients)
+	var hashBroadcast = make([]*peer, 0, len(peers))
+	for _, p := range peers {
+		if !p.Useless() && len(fullBroadcast) < fullRecipients {
+			fullBroadcast = append(fullBroadcast, p)
+		} else {
+			hashBroadcast = append(hashBroadcast, p)
+		}
+	}
+	for _, peer := range fullBroadcast {
+		peer.AsyncSendEvents(inter.EventPayloads{event}, peer.queue)
+	}
+	// Broadcast of event hash to the rest peers
+	for _, peer := range hashBroadcast {
+		peer.AsyncSendEventIDs(hash.Events{event.ID()}, peer.queue)
+	}
+	log.Trace("Broadcast event", "hash", id, "fullRecipients", len(fullBroadcast), "hashRecipients", len(hashBroadcast))
+	return len(peers)
 }
 
 // BroadcastTxs will propagate a batch of transactions to all peers which are not known to
 // already have the given transaction.
 func (h *handler) BroadcastTxs(txs types.Transactions) {
-	peers := peerSlicePool.Get().([]*peer)
-	peers = h.peers.ListTo(peers[:0])
-	defer peerSlicePool.Put(peers)
-	if len(peers) == 0 {
-		return
-	}
+	var txset = make(map[*peer]types.Transactions)
 
-	// Optimization: Iterate peers and filter txs for each peer using a reusable buffer.
-	// This avoids allocating a map of slices and multiple slice resizes. Use pool to avoid heap alloc.
-	packet := txBufPool.Get().(types.Transactions)
-	if cap(packet) < len(txs) {
-		packet = make(types.Transactions, 0, len(txs))
-	}
-	defer txBufPool.Put(packet)
-
-	for _, p := range peers {
-		packet = packet[:0] // Reset length, keep capacity
-		packet = p.FilterKnownTxs(txs, packet)
-
-		if len(packet) > 0 {
-			SplitTransactions(packet, func(batch types.Transactions) {
-				p.AsyncSendTransactions(batch, p.queue)
-			})
+	// Broadcast transactions to a batch of peers not knowing about it
+	totalSize := common.StorageSize(0)
+	for _, tx := range txs {
+		peers := h.peers.PeersWithoutTx(tx.Hash())
+		for _, peer := range peers {
+			txset[peer] = append(txset[peer], tx)
 		}
+		totalSize += common.StorageSize(tx.Size())
+		log.Trace("Broadcast transaction", "hash", tx.Hash(), "recipients", len(peers))
 	}
-}
-
-// BroadcastTransaction broadcasts a transaction to all connected peers.
-func (h *handler) BroadcastTx(tx *types.Transaction) {
-	peers := peerSlicePool.Get().([]*peer)
-	peers = h.peers.ListTo(peers[:0])
-	defer peerSlicePool.Put(peers)
-
-	txs := txBufPool.Get().(types.Transactions)
-	txs = append(txs[:0], tx)
-	defer txBufPool.Put(txs)
-
-	for _, p := range peers {
-		p.AsyncSendTransactions(txs, p.queue)
-	}
-}
-
-// BroadcastEvents will propagate a batch of events to all peers which are not known to
-// already have the given event.
-func (h *handler) BroadcastEvents(events inter.EventPayloads) {
-	peers := peerSlicePool.Get().([]*peer)
-	peers = h.peers.ListTo(peers[:0])
-	defer peerSlicePool.Put(peers)
-	if len(peers) == 0 {
-		return
-	}
-
-	// Optimization: Iterate peers and filter events for each peer using a reusable buffer.
-	// This avoids allocating a map of slices and multiple slice resizes. Use pool to avoid heap alloc.
-	packet := eventBufPool.Get().(inter.EventPayloads)
-	if cap(packet) < len(events) {
-		packet = make(inter.EventPayloads, 0, len(events))
-	}
-	defer eventBufPool.Put(packet)
-
-	for _, p := range peers {
-		packet = packet[:0] // Reset length, keep capacity
-		packet = p.FilterKnownEvents(events, packet)
-
-		if len(packet) > 0 {
-			// Split events into smaller batches
-			remaining := packet
-			for len(remaining) > 0 {
-				batchSize := 0
-				var batch inter.EventPayloads
-				for i, e := range remaining {
-					batchSize += e.Size() + 1024
-					batch = remaining[:i+1]
-					if batchSize >= softResponseLimitSize || i+1 >= softLimitItems {
-						break
-					}
+	fullRecipients := h.decideBroadcastAggressiveness(int(totalSize), time.Second, len(txset))
+	i := 0
+	for peer, txs := range txset {
+		SplitTransactions(txs, func(batch types.Transactions) {
+			if i < fullRecipients {
+				peer.AsyncSendTransactions(batch, peer.queue)
+			} else {
+				txids := make([]common.Hash, batch.Len())
+				for i, tx := range batch {
+					txids[i] = tx.Hash()
 				}
-				remaining = remaining[len(batch):]
-				p.AsyncSendEvents(batch, p.queue)
+				peer.AsyncSendTransactionHashes(txids, peer.queue)
 			}
-		}
+		})
+		i++
 	}
 }
 
@@ -848,11 +707,11 @@ func (h *handler) peerInfoCollectionLoop(stop <-chan struct{}) {
 	collect := func() {
 		// Get a suggestion for a new peer.
 		// The number of suggestions to fetch is a trade-off between discovery speed and network load.
-		// The original value of 64 was highly aggressive and could lead to excessive connection attempts.
-		// A smaller number like 8 reduces network chatter and connection churn, while still ensuring
-		// a steady stream of new potential peers.
+		// For a Sentry node focusing on connectivity, we increase this from 8 to 32
+		// to ensure the P2P server always has a fresh pool of candidates to dial,
+		// especially when the node is under-peered.
 		suggested := make(map[string]struct{})
-		for i := 0; i < 8; i++ {
+		for i := 0; i < 32; i++ {
 			suggestion := h.connectionAdvisor.GetNewPeerSuggestion()
 			if suggestion == nil {
 				break
@@ -875,12 +734,7 @@ func (h *handler) peerInfoCollectionLoop(stop <-chan struct{}) {
 	EndSuggestions:
 
 		// Request updated peer information from current peers.
-		peers := peerSlicePool.Get().([]*peer)
-		peers = h.peers.ListTo(peers[:0])
-		// We can't defer Put here because of the loop structure and potential long execution,
-		// but for simplicity in this loop it's safer to just let GC handle it or manually Put at end.
-		// Given this is a ticker loop, let's manually Put.
-
+		peers := h.peers.List()
 		for _, peer := range peers {
 			// If we do not have the peer's end-point or it is too old, request it.
 			if info := peer.endPoint.Load(); info == nil || time.Since(info.timestamp) > h.config.Protocol.PeerEndPointUpdatePeriod {
@@ -889,10 +743,6 @@ func (h *handler) peerInfoCollectionLoop(stop <-chan struct{}) {
 					// If the end-point update request fails, do not send the peer info request.
 					continue
 				}
-			}
-
-			if err := peer.SendPeerInfoRequest(); err != nil {
-				log.Warn("Failed to send peer info request", "peer", peer.id, "err", err)
 			}
 		}
 
@@ -908,7 +758,6 @@ func (h *handler) peerInfoCollectionLoop(stop <-chan struct{}) {
 				}
 			}
 		}
-		peerSlicePool.Put(peers)
 	}
 
 	// Run immediately to speed up initial discovery
@@ -924,6 +773,76 @@ func (h *handler) peerInfoCollectionLoop(stop <-chan struct{}) {
 	}
 }
 
+func (h *handler) peerInfoMaintenanceLoop(stop <-chan struct{}) {
+	ticker := time.NewTicker(h.config.Protocol.PeerInfoMaintenancePeriod)
+	defer ticker.Stop()
+	defer h.loopsWg.Done()
+
+	for {
+		select {
+		case <-ticker.C:
+			peers := h.peers.List()
+			if len(peers) == 0 {
+				continue
+			}
+
+			// Shuffle to pick a random subset
+			rand.Shuffle(len(peers), func(i, j int) {
+				peers[i], peers[j] = peers[j], peers[i]
+			})
+
+			// Ask a small subset (e.g., up to 4 peers or 10% of the peerset)
+			limit := 4
+			if limit > len(peers) {
+				limit = len(peers)
+			}
+
+			for i := 0; i < limit; i++ {
+				if err := peers[i].SendPeerInfoRequest(); err != nil {
+					log.Warn("Failed to send maintenance peer info request", "peer", peers[i].id, "err", err)
+				}
+			}
+		case <-stop:
+			return
+		}
+	}
+}
+
+func (h *handler) statsLoop(stop <-chan struct{}) {
+	// Define the interval for logging stats. 15 seconds is a reasonable default.
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	defer h.loopsWg.Done()
+
+	for {
+		select {
+		case <-ticker.C:
+			h.logPeerStats()
+		case <-stop:
+			return
+		}
+	}
+}
+
+func (h *handler) logPeerStats() {
+	peers := h.peers.List()
+	var inbound, outbound int
+	for _, p := range peers {
+		if p.Peer.Info().Network.Inbound {
+			inbound++
+		} else {
+			outbound++
+		}
+	}
+
+	h.Log.Info("Peer statistics",
+		"connected", len(peers),
+		"inbound", inbound,
+		"outbound", outbound,
+		"useless", h.peers.UselessNum(),
+	)
+}
+
 type persistedPeer struct {
 	Enode string `json:"enode"`
 }
@@ -935,17 +854,26 @@ func (h *handler) savePeers() {
 
 	path := filepath.Join(h.dataDir, "nodes.json")
 
-	peers := peerSlicePool.Get().([]*peer)
-	peers = h.peers.ListTo(peers[:0])
-	defer peerSlicePool.Put(peers)
+	h.discoveredNodesMu.RLock()
+	defer h.discoveredNodesMu.RUnlock()
 
-	nodes := make([]persistedPeer, 0, len(peers))
-	for _, p := range peers {
+	// Create a unique set of all known nodes (connected + discovered via gossip)
+	allNodes := make(map[enode.ID]*enode.Node)
+
+	// 1. Add currently connected peers
+	for _, p := range h.peers.List() {
 		if n := p.Node(); n != nil {
-			nodes = append(nodes, persistedPeer{
-				Enode: n.String(),
-			})
+			allNodes[n.ID()] = n
 		}
+	}
+	// 2. Add all previously discovered nodes from the cache
+	for id, n := range h.discoveredNodes {
+		allNodes[id] = n
+	}
+
+	nodes := make([]persistedPeer, 0, len(allNodes))
+	for _, n := range allNodes {
+		nodes = append(nodes, persistedPeer{Enode: n.String()})
 	}
 
 	if len(nodes) == 0 {
@@ -990,6 +918,10 @@ func (h *handler) loadPeers() {
 			if err != nil {
 				continue
 			}
+			h.discoveredNodesMu.Lock()
+			h.discoveredNodes[n.ID()] = n
+			h.discoveredNodesMu.Unlock()
+
 			select {
 			case h.nextSuggestedPeer <- n:
 			case <-h.quitSync:
