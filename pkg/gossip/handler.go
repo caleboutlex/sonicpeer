@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"math/big"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -119,6 +120,7 @@ type handler struct {
 
 	localEndPointSource LocalEndPointSource
 	newTxsHook          newTxsHook
+	signer              types.Signer
 
 	logger.Instance
 
@@ -168,6 +170,7 @@ func newHandler(c handlerConfig) (*handler, error) {
 
 		localEndPointSource: c.localEndPointSource,
 		newTxsHook:          c.newTxsHook,
+		signer:              types.LatestSignerForChainID(new(big.Int).SetUint64(c.networkID)),
 
 		Instance: logger.New("PM"),
 
@@ -403,6 +406,14 @@ func (h *handler) handleTxs(p *peer, txs types.Transactions, receivedAt time.Tim
 		p.MarkTransaction(id)
 
 		if !h.txHashCache.Contains(id) {
+			// LIGHTWEIGHT VALIDATION:
+			// Verify the signature and ChainID. This filters out spam and
+			// transactions from other networks (e.g. Ethereum/Fantom).
+			if _, err := types.Sender(h.signer, tx); err != nil {
+				p.Log().Warn("Invalid transaction", "err", err, "hash", id)
+				continue
+			}
+
 			h.txHashCache.Add(id, struct{}{}, 1)
 			if h.newTxsHook != nil {
 				h.newTxsHook(tx)
@@ -494,10 +505,6 @@ func (h *handler) handleMsg(p *peer) error {
 		}
 		if err := checkLenLimits(len(txs), txs); err != nil {
 			return err
-		}
-		txids := make([]interface{}, txs.Len())
-		for i, tx := range txs {
-			txids[i] = tx.Hash()
 		}
 		h.handleTxs(p, txs, receivedAt)
 
