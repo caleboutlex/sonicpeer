@@ -1,7 +1,6 @@
 # Changelog - March 14, 2026
 
 ## [Architectural Improvements]
-- **Fast-Track Discovery**: Transaction and Hash messages now bypass the global semaphore, enabling "wire-speed" discovery independent of network load.
 - **Clean Resource Management**: Removed legacy `sync.Pool` and `bufPool` implementations in favor of modern Go direct allocations, reducing complexity.
 - **Lightweight Sentry Validation**: Implemented Signature (ECDSA) and `MinGasPrice` filtering. This ensures discovery metrics are "clean" and match standard mempool policies.
 
