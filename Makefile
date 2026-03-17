@@ -39,7 +39,6 @@ test:
 	--url "$(BACKEND_URL)" \
 	--port 3030 \
 	--ws \
-	--ws.addr 0.0.0.0 \
 	--ws.port $(WS_PORT) \
 	--ws.api "eth,net" \
 
@@ -52,7 +51,6 @@ metrics:
 	--port 3030 \
 	--metrics \
 	--ws \
-	--ws.addr 0.0.0.0 \
 	--ws.port $(WS_PORT) \
 	--ws.api "eth" \
 
@@ -77,23 +75,3 @@ run: sonicpeer
 	--maxpeers 1000 \
 	--url "$(BACKEND_URL)" \
 	--port 3030
-
-
-# monitoring-up: Starts the Grafana and Prometheus containers in detached mode.
-monitoring-up:
-	@echo "Starting monitoring stack (Prometheus & Grafana)..."
-	docker-compose -f monitoring/docker-compose.yml up -d
-
-# monitoring-down: Stops and removes the monitoring containers.
-monitoring-down:
-	@echo "Stopping monitoring stack..."
-	docker-compose -f monitoring/docker-compose.yml down
-
-monitoring-reset: 
-	@echo "Resetting monitoring stack..."
-	docker-compose -f monitoring/docker-compose.yml down && docker-compose -f monitoring/docker-compose.yml up -d
-	
-# monitoring-logs: Tails the logs from the monitoring containers.
-monitoring-logs:
-	@echo "Tailing logs for monitoring stack..."
-	docker-compose -f monitoring/docker-compose.yml logs -f

@@ -13,10 +13,11 @@ import (
 )
 
 // Sentry is the main object for the gossip agent. It encapsulates the P2P stack and the gossip service.
+// It is responsible for managing the lifecycle of the entire node.
 type Sentry struct {
-	stack   *node.Node
-	svc     *Service
-	cleanup func()
+	stack   *node.Node // The base Ethereum-style node stack (P2P, RPC, etc.)
+	svc     *Service   // The custom Sonic gossip service
+	cleanup func()     // Cleanup function to tear down protocols and the stack
 }
 
 // SentryConfig encapsulates all the configuration for the sentry node.
@@ -59,22 +60,22 @@ type SentryConfig struct {
 
 // NewSentry creates and configures a new Sentry node, but does not start it.
 func NewSentry(cfg SentryConfig) (*Sentry, error) {
-	// 1. Initialize node config with defaults and apply our config
+	// 1. Initialize the base node configuration with Sonic defaults
 	nodeCfg := config.DefaultNodeConfig()
 	nodeCfg.DataDir = cfg.DataDir
 	nodeCfg.P2P.ListenAddr = fmt.Sprintf(":%d", cfg.ListenPort)
 
-	// If the user specifies a MaxPeers value, use it. Otherwise, keep the default
-	// from DefaultNodeConfig(). A value of 0 would otherwise override the default,
-	// causing the p2p server to use its own internal default value (e.g., 100).
+	// Apply peer limit. If 0, DefaultNodeConfig's value is preserved to avoid
+	// falling back to the p2p server's internal hardcoded defaults.
 	if cfg.MaxPeers > 0 {
 		nodeCfg.P2P.MaxPeers = cfg.MaxPeers
 	}
 	log.Info("Configuring P2P peer limit", "maxPeers", nodeCfg.P2P.MaxPeers)
 
-	nodeCfg.P2P.NAT = nil // Explicitly disable NAT, sentry should have a public IP
+	// Explicitly disable NAT; Sentry nodes are expected to be on public IPs
+	nodeCfg.P2P.NAT = nil
 
-	// RPC settings
+	// Map SentryConfig RPC settings to the underlying node.Config fields
 	nodeCfg.HTTPHost = cfg.HTTPListenAddr
 	nodeCfg.HTTPPort = cfg.HTTPPort
 	nodeCfg.HTTPCors = cfg.HTTPCORSDomain
@@ -86,6 +87,7 @@ func NewSentry(cfg SentryConfig) (*Sentry, error) {
 	nodeCfg.WSModules = cfg.WSApi
 	nodeCfg.WSOrigins = cfg.WSAllowedOrigins
 	nodeCfg.WSPathPrefix = cfg.WSPathPrefix
+
 	if !cfg.HTTPEnabled {
 		nodeCfg.HTTPHost = ""
 	}
@@ -116,12 +118,12 @@ func NewSentry(cfg SentryConfig) (*Sentry, error) {
 		nodeCfg.IPCPath = shortPath
 	}
 
-	// If bootnodes are not explicitly set, use the sonic defaults.
+	// 2. Parse and configure bootnodes for peer discovery
 	var nodes []*enode.Node
 	bootnodeURLs := cfg.Bootnodes
 	if len(bootnodeURLs) == 0 {
 		log.Info("Using default bootnodes", "network", "sonic")
-		bootnodeURLs = config.Bootnodes["sonic"]
+		bootnodeURLs = config.Bootnodes["sonic"] // Fallback to hardcoded network bootnodes
 	}
 	for _, url := range bootnodeURLs {
 		if url == "" {
@@ -143,7 +145,7 @@ func NewSentry(cfg SentryConfig) (*Sentry, error) {
 		nodeCfg.P2P.StaticNodes = nodes
 	}
 
-	// 3. Create the base network stack.
+	// 3. Create the base Ethereum network stack
 	stack, err := node.New(&nodeCfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create p2p stack: %w", err)
@@ -155,18 +157,18 @@ func NewSentry(cfg SentryConfig) (*Sentry, error) {
 		}
 	}
 
-	// 5. Instantiate the Service.
+	// 4. Instantiate the Gossip Service that handles the 'opera' protocol
 	svc, err := NewService(stack, cfg.GossipConfig, cfg.DataDir, cfg.BackendURL, cfg.Genesis, cfg.NetworkID)
 	if err != nil {
 		cleanupStack()
 		return nil, fmt.Errorf("failed to create gossip service: %w", err)
 	}
 
-	// 6. Register the service's protocols and lifecycle with the node stack.
+	// 5. Register the service with the stack's lifecycle and networking
 	protocols, svcCleanup := svc.Protocols()
-	stack.RegisterProtocols(protocols)
-	stack.RegisterAPIs(svc.APIs())
-	stack.RegisterLifecycle(svc)
+	stack.RegisterProtocols(protocols) // Add "opera" sub-protocol to P2P server
+	stack.RegisterAPIs(svc.APIs())     // Add 'eth' and 'net' RPC namespaces
+	stack.RegisterLifecycle(svc)       // Hook Service.Start() into Node.Start()
 
 	sentry := &Sentry{
 		stack: stack,

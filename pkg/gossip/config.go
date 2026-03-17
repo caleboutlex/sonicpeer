@@ -3,22 +3,16 @@ package gossip
 import (
 	"fmt"
 	"math/big"
-	"path/filepath"
 	"time"
 
-	"github.com/Fantom-foundation/lachesis-base/gossip/dagprocessor"
-	"github.com/Fantom-foundation/lachesis-base/gossip/itemsfetcher"
 	"github.com/Fantom-foundation/lachesis-base/inter/dag"
 	"github.com/Fantom-foundation/lachesis-base/inter/idx"
 	"github.com/Fantom-foundation/lachesis-base/utils/cachescale"
 	"github.com/syndtr/goleveldb/leveldb/opt"
 
 	"github.com/0xsoniclabs/sonic/eventcheck/heavycheck"
-	"github.com/0xsoniclabs/sonic/gossip/evmstore"
 	"github.com/0xsoniclabs/sonic/gossip/filters"
 	"github.com/0xsoniclabs/sonic/gossip/gasprice"
-	"github.com/0xsoniclabs/sonic/gossip/protocols/dag/dagstream/dagstreamleecher"
-	"github.com/0xsoniclabs/sonic/gossip/protocols/dag/dagstream/dagstreamseeder"
 )
 
 type (
@@ -29,19 +23,10 @@ type (
 		LatencyImportance    int
 		ThroughputImportance int
 
-		EventsSemaphoreLimit dag.Metric
-		BVsSemaphoreLimit    dag.Metric
 		MsgsSemaphoreLimit   dag.Metric
 		MsgsSemaphoreTimeout time.Duration
 
 		ProgressBroadcastPeriod time.Duration
-
-		DagProcessor dagprocessor.Config
-
-		DagFetcher       itemsfetcher.Config
-		TxFetcher        itemsfetcher.Config
-		DagStreamLeecher dagstreamleecher.Config
-		DagStreamSeeder  dagstreamseeder.Config
 
 		MaxInitialTxHashesSend    int
 		MaxRandomTxHashesSend     int
@@ -98,36 +83,6 @@ type (
 
 		SentryMode bool
 	}
-
-	StoreCacheConfig struct {
-		// Cache size for full events.
-		EventsNum  int
-		EventsSize uint
-		// Cache size for event IDs
-		EventsIDsNum int
-		// Cache size for full blocks.
-		BlocksNum  int
-		BlocksSize uint
-		// Cache size for history block/epoch states.
-		BlockEpochStateNum int
-
-		LlrBlockVotesIndexes int
-		LlrEpochVotesIndexes int
-	}
-
-	// StoreConfig is a config for store db.
-	StoreConfig struct {
-		Cache StoreCacheConfig
-		// EVM is EVM store config
-		EVM                 evmstore.StoreConfig
-		MaxNonFlushedSize   int
-		MaxNonFlushedPeriod time.Duration
-	}
-
-	MetricsConfig struct {
-		Enabled bool   `json:"enabled"`
-		Addr    string `json:"addr"`
-	}
 )
 
 type PeerCacheConfig struct {
@@ -156,38 +111,10 @@ func DefaultConfig(scale cachescale.Func) Config {
 				Num:  scale.Events(5000),
 				Size: scale.U64(150 * opt.MiB),
 			},
-			EventsSemaphoreLimit: dag.Metric{
-				Num:  scale.Events(10000),
-				Size: scale.U64(30 * opt.MiB),
-			},
-			BVsSemaphoreLimit: dag.Metric{
-				Num:  scale.Events(5000),
-				Size: scale.U64(15 * opt.MiB),
-			},
+
 			MsgsSemaphoreTimeout:    10 * time.Second,
 			ProgressBroadcastPeriod: 10 * time.Second,
 
-			DagProcessor: dagprocessor.DefaultConfig(scale),
-			DagFetcher: itemsfetcher.Config{
-				ForgetTimeout:       1 * time.Minute,
-				ArriveTimeout:       1000 * time.Millisecond,
-				GatherSlack:         100 * time.Millisecond,
-				HashLimit:           20000,
-				MaxBatch:            scale.I(512),
-				MaxQueuedBatches:    scale.I(32),
-				MaxParallelRequests: 192,
-			},
-			TxFetcher: itemsfetcher.Config{
-				ForgetTimeout:       1 * time.Minute,
-				ArriveTimeout:       1000 * time.Millisecond,
-				GatherSlack:         100 * time.Millisecond,
-				HashLimit:           10000,
-				MaxBatch:            scale.I(512),
-				MaxQueuedBatches:    scale.I(32),
-				MaxParallelRequests: 64,
-			},
-			DagStreamLeecher:          dagstreamleecher.DefaultConfig(),
-			DagStreamSeeder:           dagstreamseeder.DefaultConfig(scale),
 			MaxInitialTxHashesSend:    20000,
 			MaxRandomTxHashesSend:     250, // match softLimitItems to fit into one message
 			RandomTxHashesSendPeriod:  1 * time.Second,
@@ -215,89 +142,18 @@ func DefaultConfig(scale cachescale.Func) Config {
 		MaxResponseSize: 25 * 1024 * 1024,
 		StructLogLimit:  2000,
 	}
-	sessionCfg := cfg.Protocol.DagStreamLeecher.Session
-
-	// Increase the events buffer limits to create a window time where events can be
-	// received and buffered until all the parents are known, too low values lead to
-	// stalls, where events are dropped before their parents arrive.
-	const dagBufferNumLimitCoefficient = 5
-	const dagBufferSizeLimitCoefficient = 10
-	cfg.Protocol.DagProcessor.EventsBufferLimit.Num =
-		idx.Event(sessionCfg.ParallelChunksDownload)*idx.Event(sessionCfg.DefaultChunkItemsNum)*dagBufferNumLimitCoefficient + softLimitItems
-	cfg.Protocol.DagProcessor.EventsBufferLimit.Size =
-		uint64(sessionCfg.ParallelChunksDownload)*sessionCfg.DefaultChunkItemsSize*dagBufferSizeLimitCoefficient + 8*opt.MiB
-
-	// events semaphore should be at least 2 times greater than events buffer
-	cfg.Protocol.EventsSemaphoreLimit.Num = 2 * cfg.Protocol.DagProcessor.EventsBufferLimit.Num
-	cfg.Protocol.EventsSemaphoreLimit.Size = 2 * cfg.Protocol.DagProcessor.EventsBufferLimit.Size
-
-	cfg.Protocol.DagStreamLeecher.MaxSessionRestart = 4 * time.Minute
-	cfg.Protocol.DagFetcher.ArriveTimeout = 4 * time.Second
-	cfg.Protocol.DagFetcher.HashLimit = 10000
-	cfg.Protocol.TxFetcher.HashLimit = 10000
 
 	return cfg
 }
 
 func (c *Config) Validate() error {
 	p := c.Protocol
-	defaultChunkSize := dag.Metric{
-		Num:  idx.Event(p.DagStreamLeecher.Session.DefaultChunkItemsNum),
-		Size: p.DagStreamLeecher.Session.DefaultChunkItemsSize,
-	}
-	if defaultChunkSize.Num > hardLimitItems-1 {
-		return fmt.Errorf("DefaultChunkSize.Num has to be at not greater than %d", hardLimitItems-1)
-	}
-	if defaultChunkSize.Size > protocolMaxMsgSize/2 {
-		return fmt.Errorf("DefaultChunkSize.Num has to be at not greater than %d", protocolMaxMsgSize/2)
-	}
-	if p.EventsSemaphoreLimit.Num < 2*defaultChunkSize.Num ||
-		p.EventsSemaphoreLimit.Size < 2*defaultChunkSize.Size {
-		return fmt.Errorf("EventsSemaphoreLimit has to be at least 2 times greater than %s (DefaultChunkSize)", defaultChunkSize.String())
-	}
-	if p.EventsSemaphoreLimit.Num < 2*p.DagProcessor.EventsBufferLimit.Num ||
-		p.EventsSemaphoreLimit.Size < 2*p.DagProcessor.EventsBufferLimit.Size {
-		return fmt.Errorf("EventsSemaphoreLimit has to be at least 2 times greater than %s (EventsBufferLimit)", p.DagProcessor.EventsBufferLimit.String())
-	}
-	if p.EventsSemaphoreLimit.Size < 2*protocolMaxMsgSize {
-		return fmt.Errorf("EventsSemaphoreLimit.Size has to be at least %d", 2*protocolMaxMsgSize)
-	}
+
 	if p.MsgsSemaphoreLimit.Size < protocolMaxMsgSize {
 		return fmt.Errorf("MsgsSemaphoreLimit.Size has to be at least %d", protocolMaxMsgSize)
 	}
-	if p.DagProcessor.EventsBufferLimit.Size < protocolMaxMsgSize {
-		return fmt.Errorf("EventsBufferLimit.Size has to be at least %d", protocolMaxMsgSize)
-	}
 
 	return nil
-}
-
-// DefaultStoreConfig for product.
-func DefaultStoreConfig(scale cachescale.Func) StoreConfig {
-	return StoreConfig{
-		Cache: StoreCacheConfig{
-			EventsNum:            scale.I(5000),
-			EventsSize:           scale.U(6 * opt.MiB),
-			EventsIDsNum:         scale.I(100000),
-			BlocksNum:            scale.I(5000),
-			BlocksSize:           scale.U(512 * opt.KiB),
-			BlockEpochStateNum:   scale.I(8),
-			LlrBlockVotesIndexes: scale.I(100),
-			LlrEpochVotesIndexes: scale.I(5),
-		},
-		EVM:                 evmstore.DefaultStoreConfig(scale),
-		MaxNonFlushedSize:   21*opt.MiB + scale.I(2*opt.MiB),
-		MaxNonFlushedPeriod: 30 * time.Minute,
-	}
-}
-
-// MemTestStoreConfig is for tests or inmemory.
-func MemTestStoreConfig(tmpDir string) StoreConfig {
-	cfg := DefaultStoreConfig(cachescale.Ratio{Base: 10, Target: 1})
-	cfg.EVM.StateDb.Directory = filepath.Join(tmpDir, "carmen")
-	cfg.EVM.StateDb.LiveCache = 100    // bytes, to be overridden by the minimal value
-	cfg.EVM.StateDb.ArchiveCache = 100 // bytes, to be overridden by the minimal value
-	return cfg
 }
 
 func DefaultPeerCacheConfig(scale cachescale.Func) PeerCacheConfig {
